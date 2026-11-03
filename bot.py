@@ -38,19 +38,15 @@ def enviar_telegram(mensaje):
 # 2. DESCARGA DESDE BITGET FUTUROS V2 (.P)
 # ==========================================
 def obtener_velas(symbol, interval, limit=500):
-    # Mapeo de intervalos de TradingView a Bitget (ej: 5m -> 5m, 15m -> 15m)
     map_interval = {"5m": "5m", "15m": "15m", "30m": "30m"}
     granularity = map_interval.get(interval, "5m")
-    
     url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&productType=USDT-FUTURES&granularity={granularity}&limit={limit}"
-    
     try:
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
             res = r.json()
             data = res.get("data", [])
             if isinstance(data, list) and len(data) > 50:
-                # Bitget devuelve [timestamp, open, high, low, close, volume, q_vol]
                 df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "q_vol"])
                 df["open_time"] = df["open_time"].astype(np.int64)
                 df = df.sort_values("open_time").reset_index(drop=True)
@@ -61,7 +57,6 @@ def obtener_velas(symbol, interval, limit=500):
                 return df
     except Exception as e:
         print(f"⚠️ Error conectando a Bitget para {symbol}: {e}")
-        
     return None
 
 # ==========================================
@@ -109,8 +104,11 @@ def calc_vwap_tv(df):
     return cum_pv / cum_vol
 
 # ==========================================
-# 4. SIMULADOR COMPLETO VELA POR VELA (V3.7)
+# 4. MOTOR DE ANALISIS Y SEGUIMIENTO ACTIVO
 # ==========================================
+# Estados de operacion activos por moneda en memoria global
+estado_operaciones = {}
+
 def analizar_moneda(symbol):
     df5 = obtener_velas(symbol, "5m", 500)
     df15 = obtener_velas(symbol, "15m", 200)
@@ -253,6 +251,187 @@ def analizar_moneda(symbol):
 
         gatillo_l = vela_firme_l and (c_arr[i] > h_arr[i-1]) and apoyo_l
         gatillo_s = vela_firme_s and (c_arr[i] < l_arr[i-1]) and apoyo_s
+
+        cool_l_ok = not (ult_dir_sl == 1 and barras_desde_sl <= VELAS_COOLDOWN)
+        cool_s_ok = not (ult_dir_sl == -1 and barras_desde_sl <= VELAS_COOLDOWN)
+
+        no_rechazo_baj = (barras_liq_baj > 3) and (np.isnan(res_actual) or c_arr[i] > res_actual or h_arr[i] > h_arr[i-2])
+        no_rebote_alc = (barras_liq_alc > 3) and (np.isnan(sop_actual) or c_arr[i] < sop_actual or l_arr[i] < l_arr[i-2])
+
+        alc_local = (c_arr[i] > ema9_arr[i] > ema21_arr[i]) and pend_alc and (48 < rsi_arr[i] < 67) and no_ext and fuerza_tend and gatillo_l and cool_l_ok and (not muro_res_cerca) and no_rechazo_baj
+        baj_local = (c_arr[i] < ema9_arr[i] < ema21_arr[i]) and pend_baj and (33 < rsi_arr[i] < 52) and no_ext and fuerza_tend and gatillo_s and cool_s_ok and (not muro_sop_cerca) and no_rebote_alc
+
+        es_finde = dt_utc4[i].weekday() in [5, 6]
+        dia_habil = OPERAR_FINDE or (not es_finde)
+        en_hora = HORA_INICIO <= dt_utc4[i].hour < HORA_FIN
+        en_horario = en_hora and dia_habil
+        pausado = racha_l >= MAX_DERROTAS
+
+        s_long = (not en_operacion) and (not fin_op) and alc_local and mtf_alc and en_horario and (not pausado)
+        s_short = (not en_operacion) and (not fin_op) and baj_local and mtf_baj and en_horario and (not pausado)
+
+        if s_long or s_short:
+            en_operacion = True
+            tp1_alcanzado = False
+            direccion = 1 if s_long else -1
+            precio_entrada = c_arr[i]
+            sl_activo = (c_arr[i] - dist_sl) if s_long else (c_arr[i] + dist_sl)
+            tp1_activo = (c_arr[i] + dist_sl * RATIO_TP1) if s_long else (c_arr[i] - dist_sl * RATIO_TP1)
+            tp2_activo = (c_arr[i] + dist_sl * RATIO_TP2) if s_long else (c_arr[i] - dist_sl * RATIO_TP2)
+            pos_size = riesgo_usd / dist_sl if dist_sl > 0 else 0.0
+
+        if i == last_closed_idx:
+            senal_long_ult = s_long
+            senal_short_ult = s_short
+            dir_proy = -1 if mtf_baj else 1
+            bloqueo_muro = (dir_proy == 1 and muro_res_cerca) or (dir_proy == -1 and muro_sop_cerca)
+            if not dia_habil:
+                estado_ult = "🏖️ FIN DE SEMANA"
+            elif pausado:
+                estado_ult = f"⛔ PAUSA ({racha_l}/{MAX_DERROTAS})"
+            elif not en_hora:
+                estado_ult = "🌙 CERRADO"
+            elif en_operacion:
+                estado_ult = ("🛡️ LONG BE" if tp1_alcanzado else "🟢 LONG") if direccion == 1 else ("🛡️ SHORT BE" if tp1_alcanzado else "🔴 SHORT")
+            elif bloqueo_muro:
+                estado_ult = "🧱 MURO S/R"
+            elif not fuerza_tend:
+                estado_ult = f"⏸️ RANGO (ADX {adx_arr[i]:.0f})"
+            else:
+                estado_ult = "🔍 ACTIVO"
+
+    c_ult = c_arr[last_closed_idx]
+    dist_ult = atr_arr[last_closed_idx] * MULT_ATR
+    lot_ult = riesgo_usd / dist_ult if dist_ult > 0 else 0.0
+    txt_s = "--" if np.isnan(sop_actual) else f"{sop_actual:.1f}"
+    txt_r = "--" if np.isnan(res_actual) else f"{res_actual:.1f}"
+
+    # Verificacion en tiempo real con la vela actual en curso (High / Low) para SL y TPs
+    h_live = df5["high"].iloc[-1]
+    l_live = df5["low"].iloc[-1]
+    
+    if symbol in estado_operaciones:
+        op = estado_operaciones[symbol]
+        if op["dir"] == 1: # LONG
+            if not op["tp1_hit"] and h_live >= op["tp1"]:
+                op["tp1_hit"] = True
+                op["sl"] = op["entry"] # Mover SL a Break-Even
+                enviar_telegram(f"1️⃣ <b>TP1 ALCANZADO | {symbol} (LONG)</b>\nPrecio actual tocó {h_live:.2f}!\n🛡️ ¡Cobra 50% y mueve el SL a Break-Even ({op['entry']:.2f})!")
+            if op["tp1_hit"] and l_live <= op["sl"]:
+                enviar_telegram(f"🛡️ <b>BREAK-EVEN TOCADO | {symbol} (LONG)</b>\nEl precio retrocedió y cerró en BE ({op['sl']:.2f}). Operación protegida sin pérdidas.")
+                del estado_operaciones[symbol]
+            elif not op["tp1_hit"] and l_live <= op["sl"]:
+                enviar_telegram(f"🛑 <b>STOP LOSS TOCADO | {symbol} (LONG)</b>\nEl precio tocó el SL en {op['sl']:.2f}.")
+                del estado_operaciones[symbol]
+            elif h_live >= op["tp2"]:
+                enviar_telegram(f"🏆 <b>¡TP2 FINAL 1:4 ALCANZADO! | {symbol} (LONG)</b>\nPrecio tocó el objetivo final en {op['tp2']:.2f}! Operación completada.")
+                del estado_operaciones[symbol]
+        else: # SHORT
+            if not op["tp1_hit"] and l_live <= op["tp1"]:
+                op["tp1_hit"] = True
+                op["sl"] = op["entry"]
+                enviar_telegram(f"1️⃣ <b>TP1 ALCANZADO | {symbol} (SHORT)</b>\nPrecio actual tocó {l_live:.2f}!\n🛡️ ¡Cobra 50% y mueve el SL a Break-Even ({op['entry']:.2f})!")
+            if op["tp1_hit"] and h_live >= op["sl"]:
+                enviar_telegram(f"🛡️ <b>BREAK-EVEN TOCADO | {symbol} (SHORT)</b>\nEl precio retrocedió y tocó el BE ({op['sl']:.2f}). Operación protegida.")
+                del estado_operaciones[symbol]
+            elif not op["tp1_hit"] and h_live >= op["sl"]:
+                enviar_telegram(f"🛑 <b>STOP LOSS TOCADO | {symbol} (SHORT)</b>\nEl precio tocó el SL en {op['sl']:.2f}.")
+                del estado_operaciones[symbol]
+            elif l_live <= op["tp2"]:
+                enviar_telegram(f"🏆 <b>¡TP2 FINAL 1:4 ALCANZADO! | {symbol} (SHORT)</b>\nPrecio tocó el objetivo final en {op['tp2']:.2f}! Operación completada.")
+                del estado_operaciones[symbol]
+
+    return {
+        "symbol": symbol,
+        "close": c_ult,
+        "lotaje": pos_size if en_operacion else lot_ult,
+        "dist_sl": dist_ult,
+        "senal_long": senal_long_ult,
+        "senal_short": senal_short_ult,
+        "estado": estado_ult,
+        "sop": txt_s,
+        "res": txt_r,
+        "15m": "🟢" if t15_arr[last_closed_idx] else "🔴",
+        "30m": "🟢" if t30_arr[last_closed_idx] else "🔴",
+        "vwap": "🟢" if c_ult > vwap_arr[last_closed_idx] else "🔴",
+        "open_time": int(df5["open_time"].iloc[last_closed_idx]),
+        "sl_calc": (c_ult - dist_ult) if senal_long_ult else (c_ult + dist_ult),
+        "tp1_calc": (c_ult + dist_ult * RATIO_TP1) if senal_long_ult else (c_ult - dist_ult * RATIO_TP1),
+        "tp2_calc": (c_ult + dist_ult * RATIO_TP2) if senal_long_ult else (c_ult - dist_ult * RATIO_TP2),
+        "dir_val": 1 if senal_long_ult else (-1 if senal_short_ult else 0)
+    }
+
+# ==========================================
+# 5. BUCLE PRINCIPAL DE VIGILANCIA
+# ==========================================
+print("🚀 Iniciando D-Scalp V3.7 con Monitor de SL y TPs en vivo...")
+resumen_inicio = ["✅ <b>BOT D-SCALP V3.7 CON MONITOR ACTIVO</b>\nVigilando entradas, TP1, TP2 y SL:\n"]
+ultimas_alertas = {}
+
+for sym in SYMBOLS:
+    info = analizar_moneda(sym)
+    if info:
+        ultimas_alertas[sym] = info["open_time"]
+        linea = (
+            f"• <b>{sym}:</b> {info['close']:.2f} | {info['estado']}\n"
+            f"   {info['15m']}15m {info['30m']}30m {info['vwap']}VW | 🟢S:{info['sop']} 🔴R:{info['res']}"
+        )
+        resumen_inicio.append(linea)
+
+enviar_telegram("\n".join(resumen_inicio))
+
+while True:
+    try:
+        ahora_utc4 = datetime.now(timezone.utc) - timedelta(hours=4)
+        es_finde = ahora_utc4.weekday() in [5, 6]
+        en_hora = HORA_INICIO <= ahora_utc4.hour < HORA_FIN
+
+        if (OPERAR_FINDE or not es_finde) and en_hora:
+            for sym in SYMBOLS:
+                info = analizar_moneda(sym)
+                if not info:
+                    continue
+                
+                # Evaluamos constantemente el precio en vivo para las operaciones abiertas
+                _ = analizar_moneda(sym)
+
+                vela_id = info["open_time"]
+                if (info["senal_long"] or info["senal_short"]) and ultimas_alertas.get(sym) != vela_id:
+                    ultimas_alertas[sym] = vela_id
+                    c = info["close"]
+                    d = info["dist_sl"]
+                    tipo = "🟢 ENTRADA LONG" if info["senal_long"] else "🔴 ENTRADA SHORT"
+                    sl = info["sl_calc"]
+                    tp1 = info["tp1_calc"]
+                    tp2 = info["tp2_calc"]
+                    
+                    # Registramos la operacion en memoria para vigilarla en los proximos ciclos
+                    estado_operaciones[sym] = {
+                        "entry": c,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "dir": info["dir_val"],
+                        "tp1_hit": False
+                    }
+
+                    alerta_txt = (
+                        f"⚡ <b>D-SCALP V3.7 | {tipo}</b>\n"
+                        f"🪙 <b>Activo:</b> {sym} (5m)\n"
+                        f"📌 <b>Entrada:</b> {c:.2f}\n"
+                        f"📦 <b>Lotaje ($2 riesgo):</b> {info['lotaje']:.3f}\n"
+                        f"🛑 <b>SL:</b> {sl:.2f} | 🟢S:{info['sop']} 🔴R:{info['res']}\n"
+                        f"1️⃣ <b>TP1 (1:2):</b> {tp1:.2f}\n"
+                        f"🏆 <b>TP2 (1:4):</b> {tp2:.2f}\n"
+                        f"🕒 <b>Hora (UTC-4):</b> {ahora_utc4.strftime('%H:%M')}"
+                    )
+                    enviar_telegram(alerta_txt)
+
+        print(f"[{ahora_utc4.strftime('%H:%M:%S')}] Vigilando activamente mercados... (OK)")
+        time.sleep(20)
+    except Exception as e:
+        print(f"⚠️ Reintentando tras error temporal: {e}")
+        time.sleep(15)arr[i] < l_arr[i-1]) and apoyo_s
 
         cool_l_ok = not (ult_dir_sl == 1 and barras_desde_sl <= VELAS_COOLDOWN)
         cool_s_ok = not (ult_dir_sl == -1 and barras_desde_sl <= VELAS_COOLDOWN)
