@@ -1,0 +1,25 @@
+name: D-Scalp Bot 247
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # Se ejecuta automáticamente cada 5 minutos
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/action-setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar librerias necesarias
+        run: |
+          pip install requests pandas numpy
+
+      - name: Ejecutar Bot D-Scalp
+        run: python bot.py
