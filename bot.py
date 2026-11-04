@@ -1,69 +1,131 @@
+import os
+import json
 import time
 import requests
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 # ==========================================
-# 1. CREDENCIALES DE TELEGRAM Y CONFIG V3.7
+# 1. CONFIGURACION EXACTA D-SCALP V3.7 FINAL
 # ==========================================
-TELEGRAM_TOKEN = "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E"
-CHAT_ID = "1565351752"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E")
+CHAT_ID = os.getenv("CHAT_ID", "1565351752")
 
-SYMBOLS = ["BTCUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
 CAPITAL_USDT = 100.0
 RIESGO_PORC = 2.0
 MULT_ATR = 1.5
 RATIO_TP1 = 2.0
 RATIO_TP2 = 4.0
-MAX_DERROTAS = 2
+MAX_DERROTAS = 3        # Sincronizado con captura V3.7 (3 derrotas)
 ADX_MIN = 19
 VELAS_COOLDOWN = 8
 MAX_DIST_ATR = 1.7
 PIV_LEN = 8
 MARGEN_MURO = 0.75
 OPERAR_FINDE = False
-HORA_INICIO = 7
-HORA_FIN = 19
+HORA_INICIO = 8         # Sincronizado: 08:00 UTC-4
+HORA_FIN = 22           # Sincronizado: 22:00 UTC-4
+
+STATE_FILE = "estado_bot.json"
+CICLOS_POR_EJECUCION = 12   # Ejecuta durante ~4.5 min dentro del cron de 5 min
+INTERVALO_SEGUNDOS = 20
+
+# Sesion HTTP persistente (Keep-Alive) para baja latencia
+http_session = requests.Session()
+http_session.headers.update({"User-Agent": "DScalpProBot/3.7"})
+
+# ==========================================
+# 2. PERSISTENCIA DE ESTADO Y TELEGRAM API
+# ==========================================
+def cargar_estado():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"notificados": {}, "ultimo_resumen_dia": ""}
+
+def guardar_estado(estado):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(estado, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Error guardando estado: {e}")
 
 def enviar_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Error de red Telegram: {e}")
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": mensaje,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    for intento in range(3):
+        try:
+            r = http_session.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            elif r.status_code == 429:
+                wait_s = r.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(wait_s)
+            else:
+                print(f"⚠️ Error Telegram ({r.status_code}): {r.text}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Intento {intento+1} fallido en Telegram: {e}")
+            time.sleep(2)
+    return False
+
+def fmt_p(val):
+    if val is None or np.isnan(val):
+        return "--"
+    return f"{val:.1f}" if val >= 1000 else (f"{val:.2f}" if val >= 10 else f"{val:.3f}")
 
 # ==========================================
-# 2. DESCARGA DESDE BITGET FUTUROS V2 (.P)
+# 3. DESCARGA ASINCRONA BITGET FUTURES V2
 # ==========================================
 def obtener_velas(symbol, interval, limit=500):
-    map_interval = {"5m": "5m", "15m": "15m", "30m": "30m"}
-    granularity = map_interval.get(interval, "5m")
-    url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&productType=USDT-FUTURES&granularity={granularity}&limit={limit}"
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            res = r.json()
-            data = res.get("data", [])
-            if isinstance(data, list) and len(data) > 50:
-                df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "q_vol"])
-                df["open_time"] = df["open_time"].astype(np.int64)
-                df = df.sort_values("open_time").reset_index(drop=True)
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = df[col].astype(float)
-                df["dt_utc"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-                df["dt_utc4"] = df["dt_utc"] - timedelta(hours=4)
-                return df
-    except Exception as e:
-        print(f"⚠️ Error conectando a Bitget para {symbol}: {e}")
+    url = "https://api.bitget.com/api/v2/mix/market/candles"
+    params = {
+        "symbol": symbol,
+        "productType": "USDT-FUTURES",
+        "granularity": interval,
+        "limit": limit
+    }
+    for _ in range(2):
+        try:
+            r = http_session.get(url, params=params, timeout=8)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                if isinstance(data, list) and len(data) > 60:
+                    df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "q_vol"])
+                    df["open_time"] = df["open_time"].astype(np.int64)
+                    df = df.sort_values("open_time").reset_index(drop=True)
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        df[col] = df[col].astype(float)
+                    df["dt_utc"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+                    df["dt_utc4"] = df["dt_utc"] - timedelta(hours=4)
+                    return df
+        except Exception:
+            time.sleep(0.5)
     return None
 
+def descargar_multitemporal(symbol):
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f5 = ex.submit(obtener_velas, symbol, "5m", 500)
+        f15 = ex.submit(obtener_velas, symbol, "15m", 200)
+        f30 = ex.submit(obtener_velas, symbol, "30m", 200)
+        return f5.result(), f15.result(), f30.result()
+
 # ==========================================
-# 3. INDICADORES EXACTOS A TRADINGVIEW PINE V6
+# 4. INDICADORES MATEMATICOS PINE SCRIPT V6
 # ==========================================
 def rma(series, length):
-    return series.ewm(alpha=1.0/length, adjust=False).mean()
+    return series.ewm(alpha=1.0 / length, adjust=False).mean()
 
 def calc_rsi(close, length=14):
     delta = close.diff()
@@ -104,15 +166,10 @@ def calc_vwap_tv(df):
     return cum_pv / cum_vol
 
 # ==========================================
-# 4. MOTOR DE ANALISIS Y SEGUIMIENTO ACTIVO
+# 5. SIMULADOR DETERMINISTA DE ENTRADA Y SALIDA
 # ==========================================
-# Estados de operacion activos por moneda en memoria global
-estado_operaciones = {}
-
 def analizar_moneda(symbol):
-    df5 = obtener_velas(symbol, "5m", 500)
-    df15 = obtener_velas(symbol, "15m", 200)
-    df30 = obtener_velas(symbol, "30m", 200)
+    df5, df15, df30 = descargar_multitemporal(symbol)
     if df5 is None or df15 is None or df30 is None:
         return None
 
@@ -142,6 +199,7 @@ def analizar_moneda(symbol):
     atr_arr = df5["atr"].values
     adx_arr = df5["adx"].values
     vwap_arr = df5["vwap"].values
+    open_times = df5["open_time"].values
     dt_utc4 = df5["dt_utc4"].tolist()
 
     riesgo_usd = CAPITAL_USDT * (RIESGO_PORC / 100.0)
@@ -151,6 +209,10 @@ def analizar_moneda(symbol):
     barras_liq_baj = 999
 
     racha_l = 0
+    w_hoy = 0
+    l_hoy = 0
+    pnl_hoy = 0.0
+
     en_operacion = False
     tp1_alcanzado = False
     direccion = 0
@@ -161,20 +223,19 @@ def analizar_moneda(symbol):
     tp1_activo = np.nan
     tp2_activo = np.nan
     pos_size = 0.0
+    trade_id_activo = 0
     dia_ant = None
 
     last_closed_idx = len(df5) - 2
-    senal_long_ult = False
-    senal_short_ult = False
+    live_idx = len(df5) - 1
+    eventos_recientes = []
     estado_ult = "🔍 ACTIVO"
 
     for i in range(PIV_LEN * 2, last_closed_idx + 1):
         piv_idx = i - PIV_LEN
-        win_h = h_arr[piv_idx - PIV_LEN : i + 1]
-        win_l = l_arr[piv_idx - PIV_LEN : i + 1]
-        if h_arr[piv_idx] == np.max(win_h):
+        if h_arr[piv_idx] == np.max(h_arr[piv_idx - PIV_LEN : i + 1]):
             res_actual = h_arr[piv_idx]
-        if l_arr[piv_idx] == np.min(win_l):
+        if l_arr[piv_idx] == np.min(l_arr[piv_idx - PIV_LEN : i + 1]):
             sop_actual = l_arr[piv_idx]
 
         min_rec = np.min(l_arr[i-12 : i])
@@ -192,26 +253,81 @@ def analizar_moneda(symbol):
         dia_actual = dt_utc4[i].date()
         if dia_ant is not None and dia_actual != dia_ant:
             racha_l = 0
+            w_hoy = 0
+            l_hoy = 0
+            pnl_hoy = 0.0
             ult_dir_sl = 0
         dia_ant = dia_actual
 
+        # Evaluacion determinista de salidas en vela i
         raw_sl_long = en_operacion and direccion == 1 and l_arr[i] <= sl_activo
         raw_sl_short = en_operacion and direccion == -1 and h_arr[i] >= sl_activo
         raw_sl = raw_sl_long or raw_sl_short
 
         sl_tocado = raw_sl and (not tp1_alcanzado)
+        be_tocado = raw_sl and tp1_alcanzado
         tp2_tocado = en_operacion and (not raw_sl) and ((direccion == 1 and h_arr[i] >= tp2_activo) or (direccion == -1 and l_arr[i] <= tp2_activo))
         tp1_tocado = en_operacion and (not raw_sl) and (not tp1_alcanzado) and ((direccion == 1 and h_arr[i] >= tp1_activo) or (direccion == -1 and l_arr[i] <= tp1_activo))
 
+        ganancia_m1 = riesgo_usd * 0.5 * RATIO_TP1
+        ganancia_m2 = riesgo_usd * 0.5 * RATIO_TP2
+
         if sl_tocado:
             racha_l += 1
+            l_hoy += 1
+            pnl_hoy -= riesgo_usd
             ult_dir_sl = direccion
             barras_desde_sl = 0
         else:
             if tp1_tocado:
                 racha_l = 0
+                w_hoy += 1
+                pnl_hoy += ganancia_m1
                 ult_dir_sl = 0
+            if tp2_tocado:
+                pnl_hoy += ganancia_m2
             barras_desde_sl += 1
+
+        # Si el evento ocurrio en las ultimas 2 velas cerradas, lo registramos para despacho seguro
+        if i >= last_closed_idx - 1:
+            t_str = dt_utc4[i].strftime("%H:%M")
+            if tp1_tocado:
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_TP1",
+                    "tipo": "TP1",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": tp1_activo,
+                    "entry": precio_entrada,
+                    "tp2": tp2_activo,
+                    "hora": t_str
+                })
+            if tp2_tocado:
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_TP2",
+                    "tipo": "TP2",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": tp2_activo,
+                    "entry": precio_entrada,
+                    "hora": t_str
+                })
+            if sl_tocado:
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_SL",
+                    "tipo": "SL",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": sl_activo,
+                    "entry": precio_entrada,
+                    "hora": t_str
+                })
+            if be_tocado:
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_BE",
+                    "tipo": "BE",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": sl_activo,
+                    "entry": precio_entrada,
+                    "hora": t_str
+                })
 
         fin_op = raw_sl or tp2_tocado
         if fin_op:
@@ -222,6 +338,7 @@ def analizar_moneda(symbol):
             tp1_alcanzado = True
             sl_activo = precio_entrada
 
+        # Condiciones de entrada V3.7 Final
         dist_sl = atr_arr[i] * MULT_ATR
         req_espacio = dist_sl * RATIO_TP1 * MARGEN_MURO
 
@@ -253,6 +370,123 @@ def analizar_moneda(symbol):
         gatillo_s = vela_firme_s and (c_arr[i] < l_arr[i-1]) and apoyo_s
 
         cool_l_ok = not (ult_dir_sl == 1 and barras_desde_sl <= VELAS_COOLDOWN)
+        cool_s_ok = not (ult_dir_sl == -1 and barras_desde_sl <= VELAS_COOLDOWN)
+
+        no_rechazo_baj = (barras_liq_baj > 3) and (np.isnan(res_actual) or c_arr[i] > res_actual or h_arr[i] > h_arr[i-2])
+        no_rebote_alc = (barras_liq_alc > 3) and (np.isnan(sop_actual) or c_arr[i] < sop_actual or l_arr[i] < l_arr[i-2])
+
+        alc_local = (c_arr[i] > ema9_arr[i] > ema21_arr[i]) and pend_alc and (48 < rsi_arr[i] < 67) and no_ext and fuerza_tend and gatillo_l and cool_l_ok and (not muro_res_cerca) and no_rechazo_baj
+        baj_local = (c_arr[i] < ema9_arr[i] < ema21_arr[i]) and pend_baj and (33 < rsi_arr[i] < 52) and no_ext and fuerza_tend and gatillo_s and cool_s_ok and (not muro_sop_cerca) and no_rebote_alc
+
+        es_finde = dt_utc4[i].weekday() in [5, 6]
+        dia_habil = OPERAR_FINDE or (not es_finde)
+        en_hora = HORA_INICIO <= dt_utc4[i].hour < HORA_FIN
+        en_horario = en_hora and dia_habil
+        pausado = racha_l >= MAX_DERROTAS
+
+        s_long = (not en_operacion) and (not fin_op) and alc_local and mtf_alc and en_horario and (not pausado)
+        s_short = (not en_operacion) and (not fin_op) and baj_local and mtf_baj and en_horario and (not pausado)
+
+        if s_long or s_short:
+            en_operacion = True
+            tp1_alcanzado = False
+            direccion = 1 if s_long else -1
+            precio_entrada = c_arr[i]
+            sl_activo = (c_arr[i] - dist_sl) if s_long else (c_arr[i] + dist_sl)
+            tp1_activo = (c_arr[i] + dist_sl * RATIO_TP1) if s_long else (c_arr[i] - dist_sl * RATIO_TP1)
+            tp2_activo = (c_arr[i] + dist_sl * RATIO_TP2) if s_long else (c_arr[i] - dist_sl * RATIO_TP2)
+            pos_size = riesgo_usd / dist_sl if dist_sl > 0 else 0.0
+            trade_id_activo = int(open_times[i])
+
+            if i == last_closed_idx:
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_ENTRY",
+                    "tipo": "ENTRY",
+                    "dir": "LONG" if s_long else "SHORT",
+                    "entry": precio_entrada,
+                    "lotaje": pos_size,
+                    "sl": sl_activo,
+                    "tp1": tp1_activo,
+                    "tp2": tp2_activo,
+                    "sop": fmt_p(sop_actual),
+                    "res": fmt_p(res_actual),
+                    "hora": dt_utc4[i].strftime("%H:%M")
+                })
+
+        if i == last_closed_idx:
+            dir_proy = -1 if mtf_baj else 1
+            bloqueo_muro = (dir_proy == 1 and muro_res_cerca) or (dir_proy == -1 and muro_sop_cerca)
+            if not dia_habil:
+                estado_ult = "🏖️ FINDE"
+            elif pausado:
+                estado_ult = f"⛔ PAUSA ({racha_l}/{MAX_DERROTAS})"
+            elif not en_hora:
+                estado_ult = "🌙 CERRADO"
+            elif en_operacion:
+                estado_ult = ("🛡️ LONG BE" if tp1_alcanzado else "🟢 LONG") if direccion == 1 else ("🛡️ SHORT BE" if tp1_alcanzado else "🔴 SHORT")
+            elif bloqueo_muro:
+                estado_ult = "🧱 MURO S/R"
+            elif not fuerza_tend:
+                estado_ult = f"⏸️ RANGO (ADX {adx_arr[i]:.0f})"
+            else:
+                estado_ult = "🔍 ACTIVO"
+
+    # Evaluacion intrabar en vivo (vela actual en formacion: live_idx) para alertas instantaneas de salida
+    if en_operacion:
+        h_live = h_arr[live_idx]
+        l_live = l_arr[live_idx]
+        hora_live = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%H:%M")
+        raw_sl_live = (direccion == 1 and l_live <= sl_activo) or (direccion == -1 and h_live >= sl_activo)
+
+        if raw_sl_live and not tp1_alcanzado:
+            eventos_recientes.append({
+                "uid": f"{symbol}_{trade_id_activo}_SL",
+                "tipo": "SL",
+                "dir": "LONG" if direccion == 1 else "SHORT",
+                "precio": sl_activo,
+                "entry": precio_entrada,
+                "hora": hora_live
+            })
+        elif raw_sl_live and tp1_alcanzado:
+            eventos_recientes.append({
+                "uid": f"{symbol}_{trade_id_activo}_BE",
+                "tipo": "BE",
+                "dir": "LONG" if direccion == 1 else "SHORT",
+                "precio": sl_activo,
+                "entry": precio_entrada,
+                "hora": hora_live
+            })
+        else:
+            if not tp1_alcanzado and ((direccion == 1 and h_live >= tp1_activo) or (direccion == -1 and l_live <= tp1_activo)):
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_TP1",
+                    "tipo": "TP1",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": tp1_activo,
+                    "entry": precio_entrada,
+                    "tp2": tp2_activo,
+                    "hora": hora_live
+                })
+            if (direccion == 1 and h_live >= tp2_activo) or (direccion == -1 and l_live <= tp2_activo):
+                eventos_recientes.append({
+                    "uid": f"{symbol}_{trade_id_activo}_TP2",
+                    "tipo": "TP2",
+                    "dir": "LONG" if direccion == 1 else "SHORT",
+                    "precio": tp2_activo,
+                    "entry": precio_entrada,
+                    "hora": hora_live
+                })
+
+    c_ult = c_arr[last_closed_idx]
+    return {
+        "symbol": symbol,
+        "close": fmt_p(c_ult),
+        "estado": estado_ult,
+        "sop": fmt_p(sop_actual),
+        "res": fmt_p(res_actual),
+        "15m": "🟢" if t15_arr[last_closed_idx] else "🔴",
+        "30m": "🟢" if t30_arr[last_closed_idx] else "🔴",
+        "vwap": "🟢" if c_ult > vwap_arr[last_closed_idx] else  VELAS_COOLDOWN)
         cool_s_ok = not (ult_dir_sl == -1 and barras_desde_sl <= VELAS_COOLDOWN)
 
         no_rechazo_baj = (barras_liq_baj > 3) and (np.isnan(res_actual) or c_arr[i] > res_actual or h_arr[i] > h_arr[i-2])
