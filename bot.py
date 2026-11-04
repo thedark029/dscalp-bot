@@ -10,8 +10,8 @@ from datetime import datetime, timezone, timedelta
 # ==========================================
 # 1. CONFIGURACION EXACTA D-SCALP V3.7 FINAL
 # ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E")
-CHAT_ID = os.getenv("CHAT_ID", "1565351752")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
 CAPITAL_USDT = 100.0
