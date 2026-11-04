@@ -503,4 +503,118 @@ def formatear_alerta(sym, ev):
 
     if t == "ENTRY":
         return (
-     
+            f"⚡ <b>D-SCALP V3.7 | {d_ic} ENTRADA {ev['dir']}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Activo:</b> <code>{sym}.P</code> (5m)\n"
+            f"📌 <b>Entrada:</b> <code>{fmt_p(ev['entry'])}</code>\n"
+            f"📦 <b>Lotaje ($2):</b> <code>{ev['lotaje']:.3f}</code>\n"
+            f"🛑 <b>Stop Loss:</b> <code>{fmt_p(ev['sl'])}</code>\n"
+            f"1️⃣ <b>TP1 (1:2):</b> <code>{fmt_p(ev['tp1'])}</code>\n"
+            f"🏆 <b>TP2 (1:4):</b> <code>{fmt_p(ev['tp2'])}</code>\n"
+            f"🧱 <b>Niveles:</b> S:<code>{ev['sop']}</code> | R:<code>{ev['res']}</code>\n"
+            f"🕒 <b>Hora (UTC-4):</b> {ev['hora']}"
+        )
+    elif t == "TP1":
+        return (
+            f"1️⃣ <b>TP1 ALCANZADO (1:2) | {sym}.P</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{d_ic} <b>Dirección:</b> {ev['dir']}\n"
+            f"🎯 <b>Objetivo TP1:</b> <code>{fmt_p(ev['precio'])}</code> (+$2.00)\n"
+            f"🛡️ <b>Acción:</b> Cobrar 50% y mover SL a BE (<code>{fmt_p(ev['entry'])}</code>)\n"
+            f"🏆 <b>Siguiente meta TP2:</b> <code>{fmt_p(ev['tp2'])}</code>\n"
+            f"🕒 <b>Hora (UTC-4):</b> {ev['hora']}"
+        )
+    elif t == "TP2":
+        return (
+            f"🏆 <b>¡TP2 FINAL 1:4 ALCANZADO! | {sym}.P</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{d_ic} <b>Dirección:</b> {ev['dir']}\n"
+            f"💰 <b>Cierre Total:</b> <code>{fmt_p(ev['precio'])}</code> (+$6.00 Total)\n"
+            f"📌 <b>Entrada Base:</b> <code>{fmt_p(ev['entry'])}</code>\n"
+            f"🕒 <b>Hora (UTC-4):</b> {ev['hora']}"
+        )
+    elif t == "BE":
+        return (
+            f"🛡️ <b>SALIDA EN BREAK-EVEN | {sym}.P</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{d_ic} <b>Dirección:</b> {ev['dir']}\n"
+            f"🔒 <b>Precio BE:</b> <code>{fmt_p(ev['precio'])}</code>\n"
+            f"✅ <b>Resultado:</b> 50% cobrado en TP1 (+$2.00) y resto cerrado en $0.\n"
+            f"🕒 <b>Hora (UTC-4):</b> {ev['hora']}"
+        )
+    elif t == "SL":
+        return (
+            f"🛑 <b>STOP LOSS TOCADO | {sym}.P</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{d_ic} <b>Dirección:</b> {ev['dir']}\n"
+            f"❌ <b>Nivel SL:</b> <code>{fmt_p(ev['precio'])}</code> (-$2.00)\n"
+            f"📌 <b>Entrada:</b> <code>{fmt_p(ev['entry'])}</code>\n"
+            f"🕒 <b>Hora (UTC-4):</b> {ev['hora']}"
+        )
+    return ""
+
+# ==========================================
+# 7. EJECUCION PRINCIPAL (GITHUB ACTIONS)
+# ==========================================
+def ejecutar_ciclo_escaner(estado, es_primer_ciclo=False):
+    ahora_utc4 = datetime.now(timezone.utc) - timedelta(hours=4)
+    fecha_str = ahora_utc4.strftime("%Y-%m-%d")
+    evento_github = os.getenv("GITHUB_EVENT_NAME", "manual")
+
+    with ThreadPoolExecutor(max_workers=len(SYMBOLS)) as executor:
+        resultados = list(executor.map(analizar_moneda, SYMBOLS))
+
+    infos = [r for r in resultados if r is not None]
+
+    enviar_tabla = False
+    if es_primer_ciclo:
+        if evento_github in ["workflow_dispatch", "manual"]:
+            enviar_tabla = True
+        elif ahora_utc4.hour == HORA_INICIO and estado.get("ultimo_resumen_dia") != fecha_str:
+            enviar_tabla = True
+            estado["ultimo_resumen_dia"] = fecha_str
+
+    if enviar_tabla and infos:
+        lineas = [
+            "✅ <b>D-SCALP V3.7 | PANEL SINCRONIZADO (.P)</b>",
+            f"🕒 <i>Sesión: 08:00 - 22:00 UTC-4 ({ahora_utc4.strftime('%H:%M')})</i>",
+            "━━━━━━━━━━━━━━━━━━"
+        ]
+        for inf in infos:
+            lineas.append(
+                f"🔹 <b>{inf['symbol']}.P:</b> <code>{inf['close']}</code> | {inf['estado']}\n"
+                f"   {inf['15m']}15m {inf['30m']}30m {inf['vwap']}VW | 📊 {inf['hoy_res']}\n"
+                f"   🟢S: <code>{inf['sop']}</code> | 🔴R: <code>{inf['res']}</code>"
+            )
+            if not estado["notificados"]:
+                for ev in inf["eventos"]:
+                    estado["notificados"][ev["uid"]] = True
+        enviar_telegram("\n".join(lineas))
+        guardar_estado(estado)
+
+    hubo_cambios = False
+    for inf in infos:
+        sym = inf["symbol"]
+        for ev in inf["eventos"]:
+            uid = ev["uid"]
+            if not estado["notificados"].get(uid):
+                msg = formatear_alerta(sym, ev)
+                if msg and enviar_telegram(msg):
+                    estado["notificados"][uid] = True
+                    hubo_cambios = True
+                    print(f"[{ahora_utc4.strftime('%H:%M:%S')}] Alerta despachada: {uid}")
+
+    if len(estado["notificados"]) > 300:
+        claves = list(estado["notificados"].keys())[-150:]
+        estado["notificados"] = {k: True for k in claves}
+        hubo_cambios = True
+
+    if hubo_cambios:
+        guardar_estado(estado)
+
+if __name__ == "__main__":
+    estado_actual = cargar_estado()
+    for ciclo in range(CICLOS_POR_EJECUCION):
+        ejecutar_ciclo_escaner(estado_actual, es_primer_ciclo=(ciclo == 0))
+        if ciclo < CICLOS_POR_EJECUCION - 1:
+            time.sleep(INTERVALO_SEGUNDOS)
