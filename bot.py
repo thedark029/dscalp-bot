@@ -9,40 +9,48 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-# Silenciar avisos de consola y librerias
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VERSION = "D-SCALP V3.7"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
 
-# Parametros exactos sincronizados con:
-# D-Scalp PRO 1:4 [V3.7 Final] 100 2 1,5 2 4 3 8 0,75 1,7 19 8 UTC-4 8 22
-CAPITAL_BASE = 100.0
-RIESGO_USD = 2.0
-ATR_MULT_SL = 1.5
-RR_TP1 = 2.0
-RR_TP2 = 4.0
-MAX_LOSSES = 3
-PIVOT_LEN = 8
-MIN_BODY_RATIO = 0.75
-MAX_ATR_EXT = 1.7
-ADX_MIN = 19.0
-COOLDOWN_BARS = 8
+# Parametros identicos al Pine Script V3.7 Final
+CAPITAL_INICIAL = 100.0
+RIESGO_PORC = 2.0
+RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
+MULTIPLICADOR_ATR = 1.5
+RATIO_TP1 = 2.0
+RATIO_TP2 = 4.0
+MAX_DERROTAS = 3
+
+USAR_SR = True
+PIV_LEN = 8
+MARGEN_MURO = 0.75
+USAR_VWAP = True
+
+OPERAR_FINDE = False
+EXIGIR_VELA_FIRME = True
+MAX_DIST_ATR = 1.7
+ADX_MIN = 19
+VELAS_COOLDOWN = 8
+PERMITIR_SHORTS = True
 HORA_INICIO = 8
 HORA_FIN = 22
 
 STATE_FILE = "estado_bot.json"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E").strip()
+CHAT_ID = os.getenv("CHAT_ID", "1565351752").strip()
 EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "schedule")
 
 TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "DScalpBot/3.7"})
+SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.7"})
 
 
 def fmt_p(val):
+    if val is None or np.isnan(val):
+        return "--"
     if val >= 1000:
         return f"{val:.1f}"
     elif val >= 10:
@@ -82,10 +90,13 @@ def cargar_estado():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if data.get("motor") == "pine_v37_clone":
+                    return data
         except Exception:
             pass
     return {
+        "motor": "pine_v37_clone",
         "ultimo_resumen_dia": "",
         "ultimo_cierre_dia": "",
         "ultimo_ts_evento": {}
@@ -94,13 +105,14 @@ def cargar_estado():
 
 def guardar_estado(estado):
     try:
+        estado["motor"] = "pine_v37_clone"
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(estado, f, indent=2)
     except Exception:
         pass
 
 
-def fetch_klines(symbol, granularity="5m", total_candles=400):
+def fetch_klines(symbol, granularity="5m", total_candles=1000):
     url = "https://api.bitget.com/api/v2/mix/market/candles"
     frames = []
     end_time = None
@@ -151,153 +163,360 @@ def fetch_klines(symbol, granularity="5m", total_candles=400):
     return df
 
 
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def pine_ema(series, length):
+    arr = np.asarray(series, dtype=float)
+    out = np.full(len(arr), np.nan)
+    alpha = 2.0 / (length + 1.0)
+    valid = np.where(~np.isnan(arr))[0]
+    if len(valid) < length:
+        return out
+    start = valid[0] + length - 1
+    out[start] = np.mean(arr[valid[0]:start + 1])
+    for i in range(start + 1, len(arr)):
+        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    return out
 
 
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = ma_up / ma_down.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
+def pine_rma(series, length):
+    arr = np.asarray(series, dtype=float)
+    out = np.full(len(arr), np.nan)
+    alpha = 1.0 / float(length)
+    valid = np.where(~np.isnan(arr))[0]
+    if len(valid) < length:
+        return out
+    start = valid[0] + length - 1
+    out[start] = np.mean(arr[valid[0]:start + 1])
+    for i in range(start + 1, len(arr)):
+        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    return out
 
 
-def calc_atr_and_adx(df, period=14):
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+def pine_rsi(close, length=14):
+    arr = np.asarray(close, dtype=float)
+    diff = np.diff(arr, prepend=np.nan)
+    up = np.where(np.isnan(diff), np.nan, np.maximum(diff, 0.0))
+    down = np.where(np.isnan(diff), np.nan, np.maximum(-diff, 0.0))
+    rma_up = pine_rma(up, length)
+    rma_down = pine_rma(down, length)
+    rs = np.divide(rma_up, rma_down, out=np.zeros_like(rma_up), where=rma_down != 0)
+    return np.where(rma_down == 0, 100.0, np.where(rma_up == 0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
 
-    up_move = high - high.shift(1)
-    down_move = low.shift(1) - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
+def pine_atr_dmi(high, low, close, length=14):
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    n = len(c)
+
+    tr = np.full(n, np.nan)
+    up_move = np.full(n, np.nan)
+    down_move = np.full(n, np.nan)
+
+    tr[0] = h[0] - l[0]
+    for i in range(1, n):
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+        up_move[i] = h[i] - h[i - 1]
+        down_move[i] = l[i - 1] - l[i]
+
+    plus_dm = np.where(np.isnan(up_move), np.nan, np.where((up_move > down_move) & (up_move > 0), up_move, 0.0))
+    minus_dm = np.where(np.isnan(down_move), np.nan, np.where((down_move > up_move) & (down_move > 0), down_move, 0.0))
+
+    atr = pine_rma(tr, length)
+    rma_plus = pine_rma(plus_dm, length)
+    rma_minus = pine_rma(minus_dm, length)
+
+    plus_di = np.divide(100.0 * rma_plus, atr, out=np.zeros_like(atr), where=(atr != 0) & (~np.isnan(atr)))
+    minus_di = np.divide(100.0 * rma_minus, atr, out=np.zeros_like(atr), where=(atr != 0) & (~np.isnan(atr)))
+
+    sum_di = plus_di + minus_di
+    dx = np.where(np.isnan(rma_plus), np.nan, np.divide(100.0 * np.abs(plus_di - minus_di), np.where(sum_di == 0, 1.0, sum_di)))
+    adx = pine_rma(dx, length)
     return atr, adx
 
 
-def analizar_moneda(symbol, inicio_sesion_ms):
-    df5 = fetch_klines(symbol, "5m", 400)
-    df15 = fetch_klines(symbol, "15m", 200)
-    df30 = fetch_klines(symbol, "30m", 200)
+def analizar_moneda(symbol, fecha_hoy_utc4):
+    df5 = fetch_klines(symbol, "5m", 1000)
+    df15 = fetch_klines(symbol, "15m", 400)
+    df30 = fetch_klines(symbol, "30m", 400)
 
-    if df5.empty or len(df5) < 100:
+    if df5.empty or len(df5) < 150:
         return None
 
-    # Indicadores principales 5m
-    df5["ema9"] = calc_ema(df5["close"], 9)
-    df5["ema21"] = calc_ema(df5["close"], 21)
-    df5["ema50"] = calc_ema(df5["close"], 50)
-    df5["rsi"] = calc_rsi(df5["close"], 14)
-    df5["atr"], df5["adx"] = calc_atr_and_adx(df5, 14)
+    df5 = df5.iloc[:-1].copy().reset_index(drop=True)
 
-    # Soportes y Resistencias dinamicos (Pivot Len = 8)
-    df5["soporte"] = df5["low"].rolling(PIVOT_LEN).min()
-    df5["resistencia"] = df5["high"].rolling(PIVOT_LEN).max()
-
-    # VWAP anclado al inicio del dia (UTC-4)
-    fechas = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.tz_convert(TZ_UTC4).dt.date
-    tp = (df5["high"] + df5["low"] + df5["close"]) / 3.0
-    df5["tp_vol"] = tp * df5["vol"]
-    df5["vwap"] = df5.groupby(fechas)["tp_vol"].cumsum() / df5.groupby(fechas)["vol"].cumsum().replace(0, np.nan)
-
-    # Sincronizacion MTF sin lookahead bias (alineando cierre de 15m y 30m)
     if not df15.empty:
-        df15["t15_bull"] = calc_ema(df15["close"], 9) > calc_ema(df15["close"], 21)
-        df15_sync = df15[["ts", "t15_bull"]].copy()
-        df15_sync["ts"] = df15_sync["ts"] + (10 * 60 * 1000)
-        df5 = pd.merge_asof(df5, df15_sync, on="ts", direction="backward")
-        df5["t15_bull"] = df5["t15_bull"].fillna(True)
+        df15["ema21"] = pine_ema(df15["close"].values, 21)
+        df15["t_15m_alc"] = df15["close"].shift(1) > df15["ema21"].shift(1)
+        df5 = pd.merge_asof(df5, df15[["ts", "t_15m_alc"]], on="ts", direction="backward")
+        df5["t_15m_alc"] = df5["t_15m_alc"].fillna(False)
     else:
-        df5["t15_bull"] = True
+        df5["t_15m_alc"] = False
 
     if not df30.empty:
-        df30["t30_bull"] = calc_ema(df30["close"], 9) > calc_ema(df30["close"], 21)
-        df30_sync = df30[["ts", "t30_bull"]].copy()
-        df30_sync["ts"] = df30_sync["ts"] + (25 * 60 * 1000)
-        df5 = pd.merge_asof(df5, df30_sync, on="ts", direction="backward")
-        df5["t30_bull"] = df5["t30_bull"].fillna(True)
+        df30["ema21"] = pine_ema(df30["close"].values, 21)
+        df30["t_30m_alc"] = df30["close"].shift(1) > df30["ema21"].shift(1)
+        df5 = pd.merge_asof(df5, df30[["ts", "t_30m_alc"]], on="ts", direction="backward")
+        df5["t_30m_alc"] = df5["t_30m_alc"].fillna(False)
     else:
-        df5["t30_bull"] = True
+        df5["t_30m_alc"] = False
 
-    # Excluir la vela actual en formacion para evaluar solo cierres confirmados
-    closed_df = df5.iloc[:-1].copy().reset_index(drop=True)
+    close = df5["close"].values
+    high = df5["high"].values
+    low = df5["low"].values
+    open_p = df5["open"].values
+    vol = df5["vol"].values
+    ts_arr = df5["ts"].values
+    t_15m_arr = df5["t_15m_alc"].values
+    t_30m_arr = df5["t_30m_alc"].values
 
-    pos_side = None
-    entry_p = sl_p = tp1_p = tp2_p = lotaje = 0.0
-    tp1_hit = False
-    w_hoy = l_hoy = 0
+    ema9 = pine_ema(close, 9)
+    ema21 = pine_ema(close, 21)
+    rsi = pine_rsi(close, 14)
+    atr, adx_val = pine_atr_dmi(high, low, close, 14)
+
+    fechas_utc = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.date
+    hlc3 = (high + low + close) / 3.0
+    df5["tp_vol"] = hlc3 * vol
+    vwap_val = (df5.groupby(fechas_utc)["tp_vol"].cumsum() / df5.groupby(fechas_utc)["vol"].cumsum().replace(0, np.nan)).values
+
+    res_actual = np.nan
+    sop_actual = np.nan
+    barras_liq_alc = 999
+    barras_liq_baj = 999
+
+    racha_l = 0
+    w_hoy = 0
+    l_hoy = 0
     pnl_hoy = 0.0
-    last_exit_idx = -999
-    eventos = []
 
-    for i in range(60, len(closed_df)):
-        row = closed_df.iloc[i]
-        prev = closed_df.iloc[i - 1]
-        ts = int(row["ts"])
+    en_operacion = False
+    tp1_alcanzado = False
+    direccion = 0
+    ult_dir_sl = 0
+    barras_desde_sl = 999
+    precio_entrada = np.nan
+    sl_activo = np.nan
+    tp1_activo = np.nan
+    tp2_activo = np.nan
+    pos_size = np.nan
 
-        # Solo operar dentro de la sesion del dia actual
-        if ts < inicio_sesion_ms:
+    prev_dia_semana = None
+    eventos_hoy = []
+
+    ganancia_mitad1 = RIESGO_USD * 0.5 * RATIO_TP1
+    ganancia_mitad2 = RIESGO_USD * 0.5 * RATIO_TP2
+
+    for i in range(2 * PIV_LEN, len(df5)):
+        c_idx = i - PIV_LEN
+        h_cand = high[c_idx]
+        if np.all(h_cand >= high[c_idx - PIV_LEN:c_idx]) and np.all(h_cand > high[c_idx + 1:c_idx + PIV_LEN + 1]):
+            res_actual = h_cand
+
+        l_cand = low[c_idx]
+        if np.all(l_cand <= low[c_idx - PIV_LEN:c_idx]) and np.all(l_cand < low[c_idx + 1:c_idx + PIV_LEN + 1]):
+            sop_actual = l_cand
+
+        if i < 30 or np.isnan(atr[i]) or np.isnan(ema21[i]) or np.isnan(adx_val[i]):
             continue
 
-        dt_vela = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
-        en_horario = HORA_INICIO <= dt_vela.hour < HORA_FIN
+        ts = int(ts_arr[i])
+        dt_local = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
+        es_dia_actual = (dt_local.date() == fecha_hoy_utc4)
 
-        h, l, c, o = row["high"], row["low"], row["close"], row["open"]
+        min_reciente = np.min(low[i - 12:i])
+        max_reciente = np.max(high[i - 12:i])
+        mecha_inf = min(open_p[i], close[i]) - low[i]
+        mecha_sup = high[i] - max(open_p[i], close[i])
 
-        # 1. Gestionar posicion abierta
-        if pos_side == "LONG":
-            if l <= sl_p:
-                if tp1_hit:
-                    eventos.append({
-                        "ts": ts, "tipo": "BE", "par": symbol,
-                        "entrada": entry_p, "salida": sl_p, "pnl": 0.0
-                    })
-                else:
-                    l_hoy += 1
-                    pnl_hoy -= RIESGO_USD
-                    eventos.append({
-                        "ts": ts, "tipo": "SL", "par": symbol,
-                        "entrada": entry_p, "salida": sl_p, "pnl": -RIESGO_USD
-                    })
-                pos_side = None
-                last_exit_idx = i
-                continue
+        barrido_alc = (low[i] < min_reciente) and (close[i] > min_reciente) and (mecha_inf > atr[i] * 0.35)
+        barrido_baj = (high[i] > max_reciente) and (close[i] < max_reciente) and (mecha_sup > atr[i] * 0.35)
 
-            if not tp1_hit and h >= tp1_p:
-                tp1_hit = True
-                sl_p = entry_p  # Proteger en Break-Even
-                w_hoy += 1
-                pnl_parcial = RIESGO_USD * 1.0  # 50% en 1:2 = +1R ($2)
-                pnl_hoy += pnl_parcial
-                eventos.append({
+        barras_liq_alc = 0 if barrido_alc else min(999, barras_liq_alc + 1)
+        barras_liq_baj = 0 if barrido_baj else min(999, barras_liq_baj + 1)
+        impulso_liq_alc = barras_liq_alc <= 6
+        impulso_liq_baj = barras_liq_baj <= 6
+
+        hora_local = dt_local.hour
+        dia_semana = dt_local.weekday()
+        es_finde = (dia_semana == 5) or (dia_semana == 6)
+        dia_habil = OPERAR_FINDE or (not es_finde)
+        en_hora = (HORA_INICIO <= hora_local < HORA_FIN)
+        en_horario = en_hora and dia_habil
+
+        if prev_dia_semana is not None and dia_semana != prev_dia_semana:
+            racha_l = 0
+            w_hoy = 0
+            l_hoy = 0
+            pnl_hoy = 0.0
+            ult_dir_sl = 0
+        prev_dia_semana = dia_semana
+
+        raw_sl_long = en_operacion and (direccion == 1) and (low[i] <= sl_activo)
+        raw_sl_short = en_operacion and (direccion == -1) and (high[i] >= sl_activo)
+        raw_sl = raw_sl_long or raw_sl_short
+
+        sl_tocado = raw_sl and (not tp1_alcanzado)
+        be_tocado = raw_sl and tp1_alcanzado
+
+        tp2_long = en_operacion and (not raw_sl) and (direccion == 1) and (high[i] >= tp2_activo)
+        tp2_short = en_operacion and (not raw_sl) and (direccion == -1) and (low[i] <= tp2_activo)
+        tp2_tocado = tp2_long or tp2_short
+
+        tp1_long = en_operacion and (not raw_sl) and (not tp1_alcanzado) and (direccion == 1) and (high[i] >= tp1_activo)
+        tp1_short = en_operacion and (not raw_sl) and (not tp1_alcanzado) and (direccion == -1) and (low[i] <= tp1_activo)
+        tp1_tocado = tp1_long or tp1_short
+
+        if sl_tocado:
+            racha_l += 1
+            l_hoy += 1
+            ult_dir_sl = direccion
+            barras_desde_sl = 0
+            if es_dia_actual:
+                eventos_hoy.append({
+                    "ts": ts, "tipo": "SL", "par": symbol,
+                    "entrada": precio_entrada, "salida": sl_activo, "pnl": -RIESGO_USD
+                })
+        else:
+            barras_desde_sl += 1
+
+        if be_tocado and es_dia_actual:
+            eventos_hoy.append({
+                "ts": ts, "tipo": "BE", "par": symbol,
+                "entrada": precio_entrada, "salida": precio_entrada, "pnl": 0.0
+            })
+
+        if tp1_tocado:
+            racha_l = 0
+            w_hoy += 1
+            ult_dir_sl = 0
+            if es_dia_actual:
+                eventos_hoy.append({
                     "ts": ts, "tipo": "TP1", "par": symbol,
-                    "entrada": entry_p, "salida": tp1_p, "pnl": pnl_parcial
+                    "entrada": precio_entrada, "salida": tp1_activo, "pnl": ganancia_mitad1
                 })
 
-            if h >= tp2_p:
-                pnl_final = RIESGO_USD * 2.0  # 50% restante en 1:4 = +2R ($4) -> Total +$6
-                pnl_hoy += pnl_final
-                eventos.append({
-                    "ts": ts, "tipo": "TP2", "par": symbol,
-                    "entrada": entry_p, "salida": tp2_p, "pnl": pnl_final
-                })
-                pos_side = None
-                last_exit_idx = i
-                continue
+        if tp2_tocado and es_dia_actual:
+            eventos_hoy.append({
+                "ts": ts, "tipo": "TP2", "par": symbol,
+                "entrada": precio_entrada, "salida": tp2_activo, "pnl": ganancia_mitad2
+            })
 
-        elif pos_side == "SHORT":
+        pnl_cambio = (-RIESGO_USD if sl_tocado else 0.0) + (ganancia_mitad1 if tp1_tocado else 0.0) + (ganancia_mitad2 if tp2_tocado else 0.0)
+        pnl_hoy += pnl_cambio
+
+        fin_op = raw_sl or tp2_tocado
+        tp1_alcanzado = False if fin_op else (True if tp1_tocado else tp1_alcanzado)
+        sl_activo = precio_entrada if (tp1_tocado and not fin_op) else sl_activo
+        en_operacion = False if fin_op else en_operacion
+        direccion = 0 if fin_op else direccion
+
+        separacion_emas = abs(ema9[i] - ema21[i]) >= (atr[i] * 0.12)
+        fuerza_tendencia = (adx_val[i] >= ADX_MIN) and separacion_emas
+        pendiente_alcista = (ema9[i] > ema9[i - 2]) and (ema21[i] > ema21[i - 2])
+        pendiente_bajista = (ema9[i] < ema9[i - 2]) and (ema21[i] < ema21[i - 2])
+
+        t_15m_alc = bool(t_15m_arr[i])
+        t_30m_alc = bool(t_30m_arr[i])
+        vwap_alc = (not USAR_VWAP) or (close[i] > vwap_val[i])
+        vwap_baj = (not USAR_VWAP) or (close[i] < vwap_val[i])
+
+        mtf_alcista = t_15m_alc and (t_30m_alc or ((close[i] > vwap_val[i]) and impulso_liq_alc)) and vwap_alc
+        mtf_bajista = (not t_15m_alc) and ((not t_30m_alc) or ((close[i] < vwap_val[i]) and impulso_liq_baj)) and vwap_baj
+
+        no_rebote_alcista = (barras_liq_alc > 3) and (np.isnan(sop_actual) or (close[i] < sop_actual) or (low[i] < low[i - 2]))
+        no_rechazo_bajista = (barras_liq_baj > 3) and (np.isnan(res_actual) or (close[i] > res_actual) or (high[i] > high[i - 2]))
+
+        dist_sl = atr[i] * MULTIPLICADOR_ATR
+        req_espacio = dist_sl * RATIO_TP1 * MARGEN_MURO
+
+        muro_res_cerca = USAR_SR and (not np.isnan(res_actual)) and (close[i] < res_actual) and ((res_actual - close[i]) < req_espacio)
+        muro_sop_cerca = USAR_SR and (not np.isnan(sop_actual)) and (close[i] > sop_actual) and ((close[i] - sop_actual) < req_espacio)
+        camino_long_ok = not muro_res_cerca
+        camino_short_ok = not muro_sop_cerca
+
+        pausado_actual = racha_l >= MAX_DERROTAS
+        no_extendido = abs(close[i] - ema21[i]) <= (atr[i] * MAX_DIST_ATR)
+
+        rango_vela = high[i] - low[i]
+        vela_firme_long = (close[i] > open_p[i]) and ((not EXIGIR_VELA_FIRME) or (rango_vela == 0) or ((high[i] - close[i]) <= rango_vela * 0.45))
+        vela_firme_short = (close[i] < open_p[i]) and ((not EXIGIR_VELA_FIRME) or (rango_vela == 0) or ((close[i] - low[i]) <= rango_vela * 0.45))
+
+        apoyo_long = (low[i] <= (ema9[i] + atr[i] * 0.35)) or (low[i - 1] <= (ema9[i - 1] + atr[i - 1] * 0.35)) or impulso_liq_alc
+        gatillo_long = vela_firme_long and (close[i] > high[i - 1]) and apoyo_long
+        cooldown_long_ok = not ((ult_dir_sl == 1) and (barras_desde_sl <= VELAS_COOLDOWN))
+
+        apoyo_short = (high[i] >= (ema9[i] - atr[i] * 0.35)) or (high[i - 1] >= (ema9[i - 1] - atr[i - 1] * 0.35)) or impulso_liq_baj
+        gatillo_short = vela_firme_short and (close[i] < low[i - 1]) and apoyo_short
+        cooldown_short_ok = not ((ult_dir_sl == -1) and (barras_desde_sl <= VELAS_COOLDOWN))
+
+        alcista_local = (
+            (close[i] > ema9[i]) and (ema9[i] > ema21[i]) and pendiente_alcista
+            and (48 < rsi[i] < 67) and no_extendido and fuerza_tendencia
+            and gatillo_long and cooldown_long_ok and camino_long_ok and no_rechazo_bajista
+        )
+        bajista_local = (
+            (close[i] < ema9[i]) and (ema9[i] < ema21[i]) and pendiente_bajista
+            and (33 < rsi[i] < 52) and no_extendido and fuerza_tendencia
+            and gatillo_short and cooldown_short_ok and camino_short_ok and no_rebote_alcista
+        )
+
+        senal_long = (not en_operacion) and (not fin_op) and alcista_local and mtf_alcista and en_horario and (not pausado_actual)
+        senal_short = PERMITIR_SHORTS and (not en_operacion) and (not fin_op) and bajista_local and mtf_bajista and en_horario and (not pausado_actual)
+        nueva_op = senal_long or senal_short
+
+        if nueva_op:
+            en_operacion = True
+            tp1_alcanzado = False
+            direccion = 1 if senal_long else -1
+            precio_entrada = close[i]
+            sl_activo = (close[i] - dist_sl) if senal_long else (close[i] + dist_sl)
+            tp1_activo = (close[i] + dist_sl * RATIO_TP1) if senal_long else (close[i] - dist_sl * RATIO_TP1)
+            tp2_activo = (close[i] + dist_sl * RATIO_TP2) if senal_long else (close[i] - dist_sl * RATIO_TP2)
+            pos_size = (RIESGO_USD / dist_sl) if dist_sl > 0 else 0.0
+
+            if es_dia_actual:
+                eventos_hoy.append({
+                    "ts": ts,
+                    "tipo": "ENTRY_LONG" if senal_long else "ENTRY_SHORT",
+                    "par": symbol,
+                    "entrada": precio_entrada,
+                    "sl": sl_activo,
+                    "tp1": tp1_activo,
+                    "tp2": tp2_activo,
+                    "lotaje": pos_size
+                })
+
+    i_ult = len(df5) - 1
+    sep_ult = abs(ema9[i_ult] - ema21[i_ult]) >= (atr[i_ult] * 0.12)
+    fuerza_ult = (adx_val[i_ult] >= ADX_MIN) and sep_ult
+    dist_sl_ult = atr[i_ult] * MULTIPLICADOR_ATR
+    req_esp_ult = dist_sl_ult * RATIO_TP1 * MARGEN_MURO
+    muro_res_ult = USAR_SR and (not np.isnan(res_actual)) and (close[i_ult] < res_actual) and ((res_actual - close[i_ult]) < req_esp_ult)
+    muro_sop_ult = USAR_SR and (not np.isnan(sop_actual)) and (close[i_ult] > sop_actual) and ((close[i_ult] - sop_actual) < req_esp_ult)
+    mtf_baj_ult = (not bool(t_15m_arr[i_ult])) and ((not bool(t_30m_arr[i_ult])) or ((close[i_ult] < vwap_val[i_ult]) and (barras_liq_baj <= 6))) and ((not USAR_VWAP) or (close[i_ult] < vwap_val[i_ult]))
+    dir_proy = -1 if mtf_baj_ult else 1
+    bloqueo_muro = (dir_proy == 1 and muro_res_ult) or (dir_proy == -1 and muro_sop_ult)
+
+    if racha_l >= MAX_DERROTAS:
+        estado_corto = f"⛔ PAUSA ({racha_l}/{MAX_DERROTAS})"
+    elif en_operacion:
+        if direccion == 1:
+            estado_corto = f"🛡️ LONG BE ({fmt_p(precio_entrada)})" if tp1_alcanzado else f"🟢 LONG ({fmt_p(precio_entrada)})"
+        else:
+            estado_corto = f"🛡️ SHORT BE ({fmt_p(precio_entrada)})" if tp1_alcanzado else f"🔴 SHORT ({fmt_p(precio_entrada)})"
+    elif bloqueo_muro:
+        estado_corto = "🧱 MURO S/R"
+    elif not fuerza_ult:
+        estado_corto = f"⏸️ RANGO (ADX {int(round(adx_val[i_ult]))})"
+    else:
+        estado_corto = "🔍 ACTIVO"
+
+    return {
+        "symbol": symbol,
+        "close": close[i_ult],
+        "estado": estado_corto,
+        "w_hoy": w_hoy,
+        "l_hoy": l_ == "SHORT":
             if h >= sl_p:
                 if tp1_hit:
                     eventos.append({
