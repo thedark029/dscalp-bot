@@ -1,9 +1,12 @@
 name: D-Scalp Bot 247
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      origen:
+        description: 'Modo de ejecucion (manual / auto)'
+        required: false
+        default: 'manual'
 
 permissions:
   contents: write
@@ -34,7 +37,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_NAME: ${{ github.event.inputs.origen == 'auto' && 'schedule' || github.event_name }}
         run: python bot.py
 
       - name: Persistir estado de alertas
