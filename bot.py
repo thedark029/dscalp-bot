@@ -516,144 +516,9 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
         "close": close[i_ult],
         "estado": estado_corto,
         "w_hoy": w_hoy,
-        "l_hoy": l_ == "SHORT":
-            if h >= sl_p:
-                if tp1_hit:
-                    eventos.append({
-                        "ts": ts, "tipo": "BE", "par": symbol,
-                        "entrada": entry_p, "salida": sl_p, "pnl": 0.0
-                    })
-                else:
-                    l_hoy += 1
-                    pnl_hoy -= RIESGO_USD
-                    eventos.append({
-                        "ts": ts, "tipo": "SL", "par": symbol,
-                        "entrada": entry_p, "salida": sl_p, "pnl": -RIESGO_USD
-                    })
-                pos_side = None
-                last_exit_idx = i
-                continue
-
-            if not tp1_hit and l <= tp1_p:
-                tp1_hit = True
-                sl_p = entry_p
-                w_hoy += 1
-                pnl_parcial = RIESGO_USD * 1.0
-                pnl_hoy += pnl_parcial
-                eventos.append({
-                    "ts": ts, "tipo": "TP1", "par": symbol,
-                    "entrada": entry_p, "salida": tp1_p, "pnl": pnl_parcial
-                })
-
-            if l <= tp2_p:
-                pnl_final = RIESGO_USD * 2.0
-                pnl_hoy += pnl_final
-                eventos.append({
-                    "ts": ts, "tipo": "TP2", "par": symbol,
-                    "entrada": entry_p, "salida": tp2_p, "pnl": pnl_final
-                })
-                pos_side = None
-                last_exit_idx = i
-                continue
-
-        # 2. Evaluar entrada con los filtros exactos de V3.7 Final
-        cooldown_ok = (i - last_exit_idx) >= COOLDOWN_BARS
-        if pos_side is None and en_horario and l_hoy < MAX_LOSSES and cooldown_ok:
-            adx_ok = row["adx"] >= ADX_MIN
-            atr_val = row["atr"]
-            if atr_val <= 0:
-                continue
-
-            rango_vela = max(h - l, 1e-8)
-            cuerpo = abs(c - o)
-            no_sobreextendida = rango_vela <= (atr_val * MAX_ATR_EXT)
-
-            # Condicion de rechazo/impulso (0.75) y pullback a EMA9/EMA21
-            cierre_fuerte_long = ((c - l) / rango_vela >= MIN_BODY_RATIO) or (cuerpo / rango_vela >= 0.45)
-            cierre_fuerte_short = ((h - c) / rango_vela >= MIN_BODY_RATIO) or (cuerpo / rango_vela >= 0.45)
-
-            bull_trend = (
-                row["ema9"] > row["ema21"] > row["ema50"]
-                and c > row["vwap"]
-                and bool(row["t15_bull"])
-                and bool(row["t30_bull"])
-            )
-            bear_trend = (
-                row["ema9"] < row["ema21"] < row["ema50"]
-                and c < row["vwap"]
-                and (not bool(row["t15_bull"]))
-                and (not bool(row["t30_bull"]))
-            )
-
-            toca_zona_long = (l <= row["ema21"] * 1.001) or (prev["low"] <= prev["ema21"] * 1.001)
-            toca_zona_short = (h >= row["ema21"] * 0.999) or (prev["high"] >= prev["ema21"] * 0.999)
-
-            gatillo_long = (
-                toca_zona_long
-                and c > row["ema9"]
-                and c > o
-                and c > prev["high"]
-                and 48 <= row["rsi"] <= 68
-                and cierre_fuerte_long
-                and no_sobreextendida
-            )
-            gatillo_short = (
-                toca_zona_short
-                and c < row["ema9"]
-                and c < o
-                and c < prev["low"]
-                and 32 <= row["rsi"] <= 52
-                and cierre_fuerte_short
-                and no_sobreextendida
-            )
-
-            if adx_ok and bull_trend and gatillo_long:
-                pos_side = "LONG"
-                entry_p = c
-                riesgo_pts = atr_val * ATR_MULT_SL
-                sl_p = entry_p - riesgo_pts
-                tp1_p = entry_p + (riesgo_pts * RR_TP1)
-                tp2_p = entry_p + (riesgo_pts * RR_TP2)
-                lotaje = RIESGO_USD / riesgo_pts
-                tp1_hit = False
-                eventos.append({
-                    "ts": ts, "tipo": "ENTRY_LONG", "par": symbol,
-                    "entrada": entry_p, "sl": sl_p, "tp1": tp1_p,
-                    "tp2": tp2_p, "lotaje": lotaje
-                })
-
-            elif adx_ok and bear_trend and gatillo_short:
-                pos_side = "SHORT"
-                entry_p = c
-                riesgo_pts = atr_val * ATR_MULT_SL
-                sl_p = entry_p + riesgo_pts
-                tp1_p = entry_p - (riesgo_pts * RR_TP1)
-                tp2_p = entry_p - (riesgo_pts * RR_TP2)
-                lotaje = RIESGO_USD / riesgo_pts
-                tp1_hit = False
-                eventos.append({
-                    "ts": ts, "tipo": "ENTRY_SHORT", "par": symbol,
-                    "entrada": entry_p, "sl": sl_p, "tp1": tp1_p,
-                    "tp2": tp2_p, "lotaje": lotaje
-                })
-
-    ult = closed_df.iloc[-1]
-    adx_actual = int(round(ult["adx"]))
-    if l_hoy >= MAX_LOSSES:
-        estado_mercado = "PAUSADO (3 SL)"
-    elif ult["adx"] >= ADX_MIN:
-        estado_mercado = "ACTIVO"
-    else:
-        estado_mercado = f"RANGO (ADX {adx_actual})"
-
-    return {
-        "symbol": symbol,
-        "close": ult["close"],
-        "estado": estado_mercado,
-        "w_hoy": w_hoy,
         "l_hoy": l_hoy,
         "pnl_hoy": pnl_hoy,
-        "eventos": eventos
+        "eventos": eventos_hoy
     }
 
 
@@ -699,8 +564,7 @@ def main():
     ahora_utc4 = datetime.now(TZ_UTC4)
     fecha_str = ahora_utc4.strftime("%Y-%m-%d")
     fecha_humana = ahora_utc4.strftime("%d/%m/%Y | %H:%M UTC-4")
-    inicio_sesion = ahora_utc4.replace(hour=HORA_INICIO, minute=0, second=0, microsecond=0)
-    inicio_sesion_ms = int(inicio_sesion.timestamp() * 1000)
+    fecha_hoy_utc4 = ahora_utc4.date()
 
     es_manual = (EVENT_NAME == "workflow_dispatch")
     en_horario_operativo = (HORA_INICIO <= ahora_utc4.hour < HORA_FIN)
@@ -713,13 +577,12 @@ def main():
         return
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        resultados = list(executor.map(lambda s: analizar_moneda(s, inicio_sesion_ms), SYMBOLS))
+        resultados = list(executor.map(lambda s: analizar_moneda(s, fecha_hoy_utc4), SYMBOLS))
 
     resultados = [r for r in resultados if r is not None]
     if not resultados:
         return
 
-    # 1. Enviar alertas de Entradas y Salidas con Fecha y Hora exacta
     ultimo_ts_map = estado.setdefault("ultimo_ts_evento", {})
     for res in resultados:
         sym = res["symbol"]
@@ -733,7 +596,6 @@ def main():
                     hubo_cambios = True
                     time.sleep(0.4)
 
-    # 2. Panel de Apertura (08:00 UTC-4 o Ejecucion Manual)
     if (en_horario_operativo and estado.get("ultimo_resumen_dia") != fecha_str) or es_manual:
         lineas = [
             f"<b>{VERSION}</b>",
@@ -743,14 +605,13 @@ def main():
             signo = "+" if r["pnl_hoy"] >= 0 else "-"
             lineas.append(
                 f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} "
-                f"({r['w_hoy']}G-{r['l_hoy']}P {signo}${abs(r['pnl_hoy']):.0f})"
+                f"| Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({signo}${abs(r['pnl_hoy']):.0f})"
             )
         if enviar_telegram("\n".join(lineas)):
             if en_horario_operativo:
                 estado["ultimo_resumen_dia"] = fecha_str
                 hubo_cambios = True
 
-    # 3. Reporte de Cierre Diario (22:00 UTC-4 o cuando se fuerza de noche)
     if es_hora_cierre and (estado.get("ultimo_cierre_dia") != fecha_str or es_manual):
         total_w = sum(r["w_hoy"] for r in resultados)
         total_l = sum(r["l_hoy"] for r in resultados)
