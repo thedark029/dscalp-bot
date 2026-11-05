@@ -8,32 +8,41 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: dscalp-bot-group
+  cancel-in-progress: false
+
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
       - name: Checkout repositorio
         uses: actions/checkout@v4
-
-      - name: Restaurar cache de estado de alertas
-        uses: actions/cache@v4
-        with:
-          path: estado_bot.json
-          key: dscalp-state-${{ github.run_id }}
-          restore-keys: |
-            dscalp-state-
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Instalar librerias necesarias
-        run: pip install requests pandas numpy
+        run: pip install -q requests pandas numpy urllib3
 
       - name: Ejecutar Bot D-Scalp V3.7
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python bot.py
+
+      - name: Persistir estado de alertas
+        run: |
+          if [ -f estado_bot.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add estado_bot.json
+            git diff --staged --quiet || (git commit -m "chore: update bot state [skip ci]" && git push)
+          fi
