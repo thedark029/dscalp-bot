@@ -9,18 +9,30 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-# Silenciar todos los warnings de consola y librerías
+# Silenciar avisos de consola y librerias
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VERSION = "D-SCALP V3.7"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
+
+# Parametros exactos sincronizados con:
+# D-Scalp PRO 1:4 [V3.7 Final] 100 2 1,5 2 4 3 8 0,75 1,7 19 8 UTC-4 8 22
+CAPITAL_BASE = 100.0
+RIESGO_USD = 2.0
+ATR_MULT_SL = 1.5
+RR_TP1 = 2.0
+RR_TP2 = 4.0
+MAX_LOSSES = 3
+PIVOT_LEN = 8
+MIN_BODY_RATIO = 0.75
+MAX_ATR_EXT = 1.7
+ADX_MIN = 19.0
+COOLDOWN_BARS = 8
 HORA_INICIO = 8
 HORA_FIN = 22
-RIESGO_USD = 2.0
-MAX_LOSSES = 3
-STATE_FILE = "estado_bot.json"
 
+STATE_FILE = "estado_bot.json"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "schedule")
@@ -38,6 +50,11 @@ def fmt_p(val):
     return f"{val:.4f}"
 
 
+def fmt_fecha_hora(ts_ms):
+    dt = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=TZ_UTC4)
+    return dt.strftime("%d/%m/%Y | %H:%M (UTC-4)")
+
+
 def enviar_telegram(texto):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
@@ -48,14 +65,14 @@ def enviar_telegram(texto):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    for intento in range(3):
+    for _ in range(3):
         try:
             r = SESSION.post(url, json=payload, timeout=10)
             if r.status_code == 200:
                 return True
             if r.status_code == 429:
-                retry_after = r.json().get("parameters", {}).get("retry_after", 3)
-                time.sleep(retry_after)
+                espera = r.json().get("parameters", {}).get("retry_after", 3)
+                time.sleep(espera)
         except Exception:
             time.sleep(2)
     return False
@@ -83,30 +100,55 @@ def guardar_estado(estado):
         pass
 
 
-def fetch_klines(symbol, granularity="5m", limit=240):
+def fetch_klines(symbol, granularity="5m", total_candles=400):
     url = "https://api.bitget.com/api/v2/mix/market/candles"
-    params = {
-        "symbol": symbol,
-        "productType": "USDT-FUTURES",
-        "granularity": granularity,
-        "limit": str(limit)
-    }
-    for _ in range(3):
-        try:
-            r = SESSION.get(url, params=params, timeout=8)
-            data = r.json()
-            if data.get("code") == "00000" and data.get("data"):
-                df = pd.DataFrame(
-                    data["data"],
-                    columns=["ts", "open", "high", "low", "close", "vol", "quote_vol"]
-                )
-                df["ts"] = df["ts"].astype(np.int64)
-                for col in ["open", "high", "low", "close", "vol"]:
-                    df[col] = df[col].astype(float)
-                return df.sort_values("ts").reset_index(drop=True)
-        except Exception:
-            time.sleep(1)
-    return pd.DataFrame()
+    frames = []
+    end_time = None
+    needed = total_candles
+
+    while needed > 0:
+        batch_limit = min(200, needed)
+        params = {
+            "symbol": symbol,
+            "productType": "USDT-FUTURES",
+            "granularity": granularity,
+            "limit": str(batch_limit)
+        }
+        if end_time is not None:
+            params["endTime"] = str(end_time)
+
+        exito = False
+        for _ in range(3):
+            try:
+                r = SESSION.get(url, params=params, timeout=8)
+                data = r.json()
+                if data.get("code") == "00000" and data.get("data"):
+                    df_batch = pd.DataFrame(
+                        data["data"],
+                        columns=["ts", "open", "high", "low", "close", "vol", "quote_vol"]
+                    )
+                    df_batch["ts"] = df_batch["ts"].astype(np.int64)
+                    for col in ["open", "high", "low", "close", "vol"]:
+                        df_batch[col] = df_batch[col].astype(float)
+                    frames.append(df_batch)
+                    oldest_ts = int(df_batch["ts"].min())
+                    end_time = oldest_ts - 1
+                    needed -= len(df_batch)
+                    exito = True
+                    if len(df_batch) < batch_limit:
+                        needed = 0
+                    break
+            except Exception:
+                time.sleep(1)
+        if not exito:
+            break
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    return df
 
 
 def calc_ema(series, period):
@@ -146,40 +188,50 @@ def calc_atr_and_adx(df, period=14):
 
 
 def analizar_moneda(symbol, inicio_sesion_ms):
-    df5 = fetch_klines(symbol, "5m", 240)
-    df15 = fetch_klines(symbol, "15m", 100)
-    df30 = fetch_klines(symbol, "30m", 100)
+    df5 = fetch_klines(symbol, "5m", 400)
+    df15 = fetch_klines(symbol, "15m", 200)
+    df30 = fetch_klines(symbol, "30m", 200)
 
-    if df5.empty or len(df5) < 60:
+    if df5.empty or len(df5) < 100:
         return None
 
-    # Indicadores 5m
+    # Indicadores principales 5m
     df5["ema9"] = calc_ema(df5["close"], 9)
     df5["ema21"] = calc_ema(df5["close"], 21)
     df5["ema50"] = calc_ema(df5["close"], 50)
     df5["rsi"] = calc_rsi(df5["close"], 14)
     df5["atr"], df5["adx"] = calc_atr_and_adx(df5, 14)
 
-    # VWAP diario (UTC-4)
+    # Soportes y Resistencias dinamicos (Pivot Len = 8)
+    df5["soporte"] = df5["low"].rolling(PIVOT_LEN).min()
+    df5["resistencia"] = df5["high"].rolling(PIVOT_LEN).max()
+
+    # VWAP anclado al inicio del dia (UTC-4)
     fechas = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.tz_convert(TZ_UTC4).dt.date
     tp = (df5["high"] + df5["low"] + df5["close"]) / 3.0
     df5["tp_vol"] = tp * df5["vol"]
     df5["vwap"] = df5.groupby(fechas)["tp_vol"].cumsum() / df5.groupby(fechas)["vol"].cumsum().replace(0, np.nan)
 
-    # Tendencia MTF 15m y 30m
+    # Sincronizacion MTF sin lookahead bias (alineando cierre de 15m y 30m)
     if not df15.empty:
         df15["t15_bull"] = calc_ema(df15["close"], 9) > calc_ema(df15["close"], 21)
-        df5 = pd.merge_asof(df5, df15[["ts", "t15_bull"]], on="ts", direction="backward")
+        df15_sync = df15[["ts", "t15_bull"]].copy()
+        df15_sync["ts"] = df15_sync["ts"] + (10 * 60 * 1000)
+        df5 = pd.merge_asof(df5, df15_sync, on="ts", direction="backward")
+        df5["t15_bull"] = df5["t15_bull"].fillna(True)
     else:
         df5["t15_bull"] = True
 
     if not df30.empty:
         df30["t30_bull"] = calc_ema(df30["close"], 9) > calc_ema(df30["close"], 21)
-        df5 = pd.merge_asof(df5, df30[["ts", "t30_bull"]], on="ts", direction="backward")
+        df30_sync = df30[["ts", "t30_bull"]].copy()
+        df30_sync["ts"] = df30_sync["ts"] + (25 * 60 * 1000)
+        df5 = pd.merge_asof(df5, df30_sync, on="ts", direction="backward")
+        df5["t30_bull"] = df5["t30_bull"].fillna(True)
     else:
         df5["t30_bull"] = True
 
-    # Simulacion determinista de la sesion sobre velas cerradas (excluyendo la ultima en formacion)
+    # Excluir la vela actual en formacion para evaluar solo cierres confirmados
     closed_df = df5.iloc[:-1].copy().reset_index(drop=True)
 
     pos_side = None
@@ -187,11 +239,15 @@ def analizar_moneda(symbol, inicio_sesion_ms):
     tp1_hit = False
     w_hoy = l_hoy = 0
     pnl_hoy = 0.0
+    last_exit_idx = -999
     eventos = []
 
-    for i in range(50, len(closed_df)):
+    for i in range(60, len(closed_df)):
         row = closed_df.iloc[i]
+        prev = closed_df.iloc[i - 1]
         ts = int(row["ts"])
+
+        # Solo operar dentro de la sesion del dia actual
         if ts < inicio_sesion_ms:
             continue
 
@@ -200,7 +256,7 @@ def analizar_moneda(symbol, inicio_sesion_ms):
 
         h, l, c, o = row["high"], row["low"], row["close"], row["open"]
 
-        # 1. Evaluar salida si hay posicion abierta (prioridad intravela al SL/BE antes que TP)
+        # 1. Gestionar posicion abierta
         if pos_side == "LONG":
             if l <= sl_p:
                 if tp1_hit:
@@ -216,12 +272,14 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                         "entrada": entry_p, "salida": sl_p, "pnl": -RIESGO_USD
                     })
                 pos_side = None
+                last_exit_idx = i
                 continue
 
             if not tp1_hit and h >= tp1_p:
                 tp1_hit = True
-                sl_p = entry_p  # Mover SL a Break-Even
-                pnl_parcial = RIESGO_USD * 1.0
+                sl_p = entry_p  # Proteger en Break-Even
+                w_hoy += 1
+                pnl_parcial = RIESGO_USD * 1.0  # 50% en 1:2 = +1R ($2)
                 pnl_hoy += pnl_parcial
                 eventos.append({
                     "ts": ts, "tipo": "TP1", "par": symbol,
@@ -229,14 +287,14 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                 })
 
             if h >= tp2_p:
-                w_hoy += 1
-                pnl_final = RIESGO_USD * 3.0
+                pnl_final = RIESGO_USD * 2.0  # 50% restante en 1:4 = +2R ($4) -> Total +$6
                 pnl_hoy += pnl_final
                 eventos.append({
                     "ts": ts, "tipo": "TP2", "par": symbol,
                     "entrada": entry_p, "salida": tp2_p, "pnl": pnl_final
                 })
                 pos_side = None
+                last_exit_idx = i
                 continue
 
         elif pos_side == "SHORT":
@@ -254,11 +312,13 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                         "entrada": entry_p, "salida": sl_p, "pnl": -RIESGO_USD
                     })
                 pos_side = None
+                last_exit_idx = i
                 continue
 
             if not tp1_hit and l <= tp1_p:
                 tp1_hit = True
                 sl_p = entry_p
+                w_hoy += 1
                 pnl_parcial = RIESGO_USD * 1.0
                 pnl_hoy += pnl_parcial
                 eventos.append({
@@ -267,47 +327,75 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                 })
 
             if l <= tp2_p:
-                w_hoy += 1
-                pnl_final = RIESGO_USD * 3.0
+                pnl_final = RIESGO_USD * 2.0
                 pnl_hoy += pnl_final
                 eventos.append({
                     "ts": ts, "tipo": "TP2", "par": symbol,
                     "entrada": entry_p, "salida": tp2_p, "pnl": pnl_final
                 })
                 pos_side = None
+                last_exit_idx = i
                 continue
 
-        # 2. Evaluar nueva entrada si no hay posicion abierta y estamos en horario
-        if pos_side is None and en_horario and l_hoy < MAX_LOSSES:
-            adx_ok = row["adx"] >= 18.0
-            atr_val = max(row["atr"], c * 0.0015)
+        # 2. Evaluar entrada con los filtros exactos de V3.7 Final
+        cooldown_ok = (i - last_exit_idx) >= COOLDOWN_BARS
+        if pos_side is None and en_horario and l_hoy < MAX_LOSSES and cooldown_ok:
+            adx_ok = row["adx"] >= ADX_MIN
+            atr_val = row["atr"]
+            if atr_val <= 0:
+                continue
+
+            rango_vela = max(h - l, 1e-8)
+            cuerpo = abs(c - o)
+            no_sobreextendida = rango_vela <= (atr_val * MAX_ATR_EXT)
+
+            # Condicion de rechazo/impulso (0.75) y pullback a EMA9/EMA21
+            cierre_fuerte_long = ((c - l) / rango_vela >= MIN_BODY_RATIO) or (cuerpo / rango_vela >= 0.45)
+            cierre_fuerte_short = ((h - c) / rango_vela >= MIN_BODY_RATIO) or (cuerpo / rango_vela >= 0.45)
 
             bull_trend = (
-                row["ema9"] > row["ema21"]
-                and c > row["ema50"]
+                row["ema9"] > row["ema21"] > row["ema50"]
                 and c > row["vwap"]
                 and bool(row["t15_bull"])
                 and bool(row["t30_bull"])
             )
             bear_trend = (
-                row["ema9"] < row["ema21"]
-                and c < row["ema50"]
+                row["ema9"] < row["ema21"] < row["ema50"]
                 and c < row["vwap"]
                 and (not bool(row["t15_bull"]))
                 and (not bool(row["t30_bull"]))
             )
 
-            pullback_long = l <= row["ema21"] * 1.0015 and c > row["ema9"] and c > o and 45 <= row["rsi"] <= 72
-            pullback_short = h >= row["ema21"] * 0.9985 and c < row["ema9"] and c < o and 28 <= row["rsi"] <= 55
+            toca_zona_long = (l <= row["ema21"] * 1.001) or (prev["low"] <= prev["ema21"] * 1.001)
+            toca_zona_short = (h >= row["ema21"] * 0.999) or (prev["high"] >= prev["ema21"] * 0.999)
 
-            if adx_ok and bull_trend and pullback_long:
+            gatillo_long = (
+                toca_zona_long
+                and c > row["ema9"]
+                and c > o
+                and c > prev["high"]
+                and 48 <= row["rsi"] <= 68
+                and cierre_fuerte_long
+                and no_sobreextendida
+            )
+            gatillo_short = (
+                toca_zona_short
+                and c < row["ema9"]
+                and c < o
+                and c < prev["low"]
+                and 32 <= row["rsi"] <= 52
+                and cierre_fuerte_short
+                and no_sobreextendida
+            )
+
+            if adx_ok and bull_trend and gatillo_long:
                 pos_side = "LONG"
                 entry_p = c
-                riesgo_pts = atr_val * 1.5
+                riesgo_pts = atr_val * ATR_MULT_SL
                 sl_p = entry_p - riesgo_pts
-                tp1_p = entry_p + (riesgo_pts * 2.0)
-                tp2_p = entry_p + (riesgo_pts * 4.0)
-                lotaje = RIESGO_USD / riesgo_pts if riesgo_pts > 0 else 0.0
+                tp1_p = entry_p + (riesgo_pts * RR_TP1)
+                tp2_p = entry_p + (riesgo_pts * RR_TP2)
+                lotaje = RIESGO_USD / riesgo_pts
                 tp1_hit = False
                 eventos.append({
                     "ts": ts, "tipo": "ENTRY_LONG", "par": symbol,
@@ -315,14 +403,14 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                     "tp2": tp2_p, "lotaje": lotaje
                 })
 
-            elif adx_ok and bear_trend and pullback_short:
+            elif adx_ok and bear_trend and gatillo_short:
                 pos_side = "SHORT"
                 entry_p = c
-                riesgo_pts = atr_val * 1.5
+                riesgo_pts = atr_val * ATR_MULT_SL
                 sl_p = entry_p + riesgo_pts
-                tp1_p = entry_p - (riesgo_pts * 2.0)
-                tp2_p = entry_p - (riesgo_pts * 4.0)
-                lotaje = RIESGO_USD / riesgo_pts if riesgo_pts > 0 else 0.0
+                tp1_p = entry_p - (riesgo_pts * RR_TP1)
+                tp2_p = entry_p - (riesgo_pts * RR_TP2)
+                lotaje = RIESGO_USD / riesgo_pts
                 tp1_hit = False
                 eventos.append({
                     "ts": ts, "tipo": "ENTRY_SHORT", "par": symbol,
@@ -331,9 +419,13 @@ def analizar_moneda(symbol, inicio_sesion_ms):
                 })
 
     ult = closed_df.iloc[-1]
-    estado_mercado = "ACTIVO" if ult["adx"] >= 18.0 else "RANGO"
+    adx_actual = int(round(ult["adx"]))
     if l_hoy >= MAX_LOSSES:
         estado_mercado = "PAUSADO (3 SL)"
+    elif ult["adx"] >= ADX_MIN:
+        estado_mercado = "ACTIVO"
+    else:
+        estado_mercado = f"RANGO (ADX {adx_actual})"
 
     return {
         "symbol": symbol,
@@ -349,6 +441,7 @@ def analizar_moneda(symbol, inicio_sesion_ms):
 def formatear_alerta_evento(ev):
     par = f"{ev['par']}.P (5m)"
     t = ev["tipo"]
+    fecha_hora_str = fmt_fecha_hora(ev["ts"])
 
     if t in ("ENTRY_LONG", "ENTRY_SHORT"):
         direccion = "🟢 LONG" if t == "ENTRY_LONG" else "🔴 SHORT"
@@ -360,7 +453,8 @@ def formatear_alerta_evento(ev):
             f"<b>SL:</b> {fmt_p(ev['sl'])}\n"
             f"<b>TP1 (1:2):</b> {fmt_p(ev['tp1'])}\n"
             f"<b>TP2 (1:4):</b> {fmt_p(ev['tp2'])}\n"
-            f"<b>Lotaje (${RIESGO_USD:.0f}):</b> {ev['lotaje']:.3f}"
+            f"<b>Lotaje (${RIESGO_USD:.0f}):</b> {ev['lotaje']:.3f}\n"
+            f"<b>Fecha/Hora:</b> {fecha_hora_str}"
         )
 
     etiquetas = {
@@ -377,13 +471,15 @@ def formatear_alerta_evento(ev):
         f"<b>Par:</b> {par}\n"
         f"<b>Evento:</b> {etiquetas.get(t, t)}\n"
         f"<b>Entrada:</b> {fmt_p(ev['entrada'])} | <b>Salida:</b> {fmt_p(ev['salida'])}\n"
-        f"<b>PnL:</b> {pnl_str}"
+        f"<b>PnL:</b> {pnl_str}\n"
+        f"<b>Fecha/Hora:</b> {fecha_hora_str}"
     )
 
 
 def main():
     ahora_utc4 = datetime.now(TZ_UTC4)
     fecha_str = ahora_utc4.strftime("%Y-%m-%d")
+    fecha_humana = ahora_utc4.strftime("%d/%m/%Y | %H:%M UTC-4")
     inicio_sesion = ahora_utc4.replace(hour=HORA_INICIO, minute=0, second=0, microsecond=0)
     inicio_sesion_ms = int(inicio_sesion.timestamp() * 1000)
 
@@ -394,7 +490,6 @@ def main():
     estado = cargar_estado()
     hubo_cambios = False
 
-    # Si estamos antes de las 08:00 AM y no es ejecucion manual, salir de inmediato para ahorrar minutos
     if ahora_utc4.hour < HORA_INICIO and not es_manual:
         return
 
@@ -405,7 +500,7 @@ def main():
     if not resultados:
         return
 
-    # 1. Despachar eventos pendientes (Entradas, SL, TP1, TP2, BE) ordenados por timestamp
+    # 1. Enviar alertas de Entradas y Salidas con Fecha y Hora exacta
     ultimo_ts_map = estado.setdefault("ultimo_ts_evento", {})
     for res in resultados:
         sym = res["symbol"]
@@ -421,20 +516,23 @@ def main():
 
     # 2. Panel de Apertura (08:00 UTC-4 o Ejecucion Manual)
     if (en_horario_operativo and estado.get("ultimo_resumen_dia") != fecha_str) or es_manual:
-        lineas = [f"<b>{VERSION}</b>", "<b>Estado de Sesión (08:00 - 22:00 UTC-4)</b>\n"]
+        lineas = [
+            f"<b>{VERSION}</b>",
+            f"<b>Estado de Sesión</b> ({fecha_humana})\n"
+        ]
         for r in resultados:
             signo = "+" if r["pnl_hoy"] >= 0 else "-"
             lineas.append(
                 f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} "
-                f"({r['w_hoy']}G-{r['l_hoy']}P {signo}${abs(r['pnl_hoy']):.1f})"
+                f"({r['w_hoy']}G-{r['l_hoy']}P {signo}${abs(r['pnl_hoy']):.0f})"
             )
         if enviar_telegram("\n".join(lineas)):
             if en_horario_operativo:
                 estado["ultimo_resumen_dia"] = fecha_str
                 hubo_cambios = True
 
-    # 3. Reporte de Cierre Diario consolidado a las 22:00 UTC-4
-    if es_hora_cierre and estado.get("ultimo_cierre_dia") != fecha_str:
+    # 3. Reporte de Cierre Diario (22:00 UTC-4 o cuando se fuerza de noche)
+    if es_hora_cierre and (estado.get("ultimo_cierre_dia") != fecha_str or es_manual):
         total_w = sum(r["w_hoy"] for r in resultados)
         total_l = sum(r["l_hoy"] for r in resultados)
         total_trades = total_w + total_l
@@ -442,7 +540,10 @@ def main():
         pnl_total = sum(r["pnl_hoy"] for r in resultados)
         signo_tot = "+" if pnl_total >= 0 else "-"
 
-        lineas = [f"<b>{VERSION}</b>", "<b>Cierre Diario (22:00 UTC-4)</b>\n"]
+        lineas = [
+            f"<b>{VERSION}</b>",
+            f"<b>Cierre Diario</b> ({ahora_utc4.strftime('%d/%m/%Y')} - 22:00 UTC-4)\n"
+        ]
         for r in resultados:
             s = "+" if r["pnl_hoy"] >= 0 else "-"
             lineas.append(
