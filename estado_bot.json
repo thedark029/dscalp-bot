@@ -1,11 +1,11 @@
 {
+  "motor": "pine_v37_clone",
   "ultimo_resumen_dia": "2026-11-05",
-  "ultimo_cierre_dia": "2026-11-04",
+  "ultimo_cierre_dia": "",
   "ultimo_ts_evento": {
     "BTCUSDT": 1793896800000,
-    "ETHUSDT": 1793906100000,
-    "SOLUSDT": 1793896500000,
-    "ZECUSDT": 1793907900000,
+    "ETHUSDT": 1793890200000,
+    "ZECUSDT": 1793906100000,
     "XAGUSDT": 1793889300000
   }
 }
