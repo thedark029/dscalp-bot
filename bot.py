@@ -44,8 +44,8 @@ HORA_INICIO = 8
 HORA_FIN = 22
 
 STATE_FILE = "estado_bot.json"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E").strip()
-CHAT_ID = os.getenv("CHAT_ID", "1565351752").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
