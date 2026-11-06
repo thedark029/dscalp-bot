@@ -9,13 +9,16 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
+# Silenciar advertencias de consola y librerias HTTP
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ==============================================================================
+# 1. PARAMETROS DEL INDICADOR D-SCALP PRO 1:4 [V3.7 FINAL]
+# ==============================================================================
 VERSION = "D-SCALP V3.7"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "XAGUSDT"]
 
-# Parametros identicos al Pine Script V3.7 Final
 CAPITAL_INICIAL = 100.0
 RIESGO_PORC = 2.0
 RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
@@ -35,19 +38,23 @@ MAX_DIST_ATR = 1.7
 ADX_MIN = 19
 VELAS_COOLDOWN = 8
 PERMITIR_SHORTS = True
+
+# Horario operativo estricto (08:00 a 22:00 UTC-4)
 HORA_INICIO = 8
 HORA_FIN = 22
 
 STATE_FILE = "estado_bot.json"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9194032898:AAEBNn1_6Z2JTDhkTKgBNWcjTki64IorQ2E").strip()
 CHAT_ID = os.getenv("CHAT_ID", "1565351752").strip()
-EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "schedule")
 
 TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.7"})
 
 
+# ==============================================================================
+# 2. FUNCIONES AUXILIARES DE FORMATO, TELEGRAM Y PERSISTENCIA
+# ==============================================================================
 def fmt_p(val):
     if val is None or np.isnan(val):
         return "--"
@@ -97,7 +104,7 @@ def cargar_estado():
             pass
     return {
         "motor": "pine_v37_clone",
-        "ultimo_resumen_dia": "",
+        "ultima_hora_resumen": "",
         "ultimo_cierre_dia": "",
         "ultimo_ts_evento": {}
     }
@@ -163,13 +170,16 @@ def fetch_klines(symbol, granularity="5m", total_candles=1000):
     return df
 
 
+# ==============================================================================
+# 3. FUNCIONES MATEMATICAS IDENTICAS A PINE SCRIPT V6 (ta.ema, ta.rma, ta.dmi)
+# ==============================================================================
 def pine_ema(series, length):
     arr = np.asarray(series, dtype=float)
     out = np.full(len(arr), np.nan)
-    alpha = 2.0 / (length + 1.0)
     valid = np.where(~np.isnan(arr))[0]
     if len(valid) < length:
         return out
+    alpha = 2.0 / (length + 1.0)
     start = valid[0] + length - 1
     out[start] = np.mean(arr[valid[0]:start + 1])
     for i in range(start + 1, len(arr)):
@@ -180,10 +190,10 @@ def pine_ema(series, length):
 def pine_rma(series, length):
     arr = np.asarray(series, dtype=float)
     out = np.full(len(arr), np.nan)
-    alpha = 1.0 / float(length)
     valid = np.where(~np.isnan(arr))[0]
     if len(valid) < length:
         return out
+    alpha = 1.0 / float(length)
     start = valid[0] + length - 1
     out[start] = np.mean(arr[valid[0]:start + 1])
     for i in range(start + 1, len(arr)):
@@ -199,7 +209,8 @@ def pine_rsi(close, length=14):
     rma_up = pine_rma(up, length)
     rma_down = pine_rma(down, length)
     rs = np.divide(rma_up, rma_down, out=np.zeros_like(rma_up), where=rma_down != 0)
-    return np.where(rma_down == 0, 100.0, np.where(rma_up == 0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
+    rsi = np.where(rma_down == 0, 100.0, np.where(rma_up == 0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
+    return rsi
 
 
 def pine_atr_dmi(high, low, close, length=14):
@@ -234,6 +245,9 @@ def pine_atr_dmi(high, low, close, length=14):
     return atr, adx
 
 
+# ==============================================================================
+# 4. MOTOR DE ANALISIS Y SIMULACION (CLON EXACTO PINE SCRIPT V3.7 FINAL)
+# ==============================================================================
 def analizar_moneda(symbol, fecha_hoy_utc4):
     df5 = fetch_klines(symbol, "5m", 1000)
     df15 = fetch_klines(symbol, "15m", 400)
@@ -242,8 +256,10 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
     if df5.empty or len(df5) < 150:
         return None
 
+    # Evaluar unicamente sobre velas cerradas confirmadas
     df5 = df5.iloc[:-1].copy().reset_index(drop=True)
 
+    # Estructura de mercado y multitemporalidad (15m y 30m con lookahead_on)
     if not df15.empty:
         df15["ema21"] = pine_ema(df15["close"].values, 21)
         df15["t_15m_alc"] = df15["close"].shift(1) > df15["ema21"].shift(1)
@@ -269,16 +285,19 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
     t_15m_arr = df5["t_15m_alc"].values
     t_30m_arr = df5["t_30m_alc"].values
 
+    # Indicadores base 5m
     ema9 = pine_ema(close, 9)
     ema21 = pine_ema(close, 21)
     rsi = pine_rsi(close, 14)
     atr, adx_val = pine_atr_dmi(high, low, close, 14)
 
+    # VWAP institucional anclado a la sesion diaria UTC
     fechas_utc = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.date
     hlc3 = (high + low + close) / 3.0
     df5["tp_vol"] = hlc3 * vol
     vwap_val = (df5.groupby(fechas_utc)["tp_vol"].cumsum() / df5.groupby(fechas_utc)["vol"].cumsum().replace(0, np.nan)).values
 
+    # Variables de estado persistentes (equivalentes a 'var' en Pine Script)
     res_actual = np.nan
     sop_actual = np.nan
     barras_liq_alc = 999
@@ -307,6 +326,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
     ganancia_mitad2 = RIESGO_USD * 0.5 * RATIO_TP2
 
     for i in range(2 * PIV_LEN, len(df5)):
+        # Deteccion de pivotes de Soporte y Resistencia: ta.pivothigh / ta.pivotlow
         c_idx = i - PIV_LEN
         h_cand = high[c_idx]
         if np.all(h_cand >= high[c_idx - PIV_LEN:c_idx]) and np.all(h_cand > high[c_idx + 1:c_idx + PIV_LEN + 1]):
@@ -323,6 +343,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
         dt_local = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
         es_dia_actual = (dt_local.date() == fecha_hoy_utc4)
 
+        # Liquidez y barridos de las ultimas 12 velas
         min_reciente = np.min(low[i - 12:i])
         max_reciente = np.max(high[i - 12:i])
         mecha_inf = min(open_p[i], close[i]) - low[i]
@@ -336,6 +357,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
         impulso_liq_alc = barras_liq_alc <= 6
         impulso_liq_baj = barras_liq_baj <= 6
 
+        # Horario local y reinicio de contadores al cambiar de dia
         hora_local = dt_local.hour
         dia_semana = dt_local.weekday()
         es_finde = (dia_semana == 5) or (dia_semana == 6)
@@ -351,6 +373,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
             ult_dir_sl = 0
         prev_dia_semana = dia_semana
 
+        # Logica de salida (SL, BE, TP1 y TP2)
         raw_sl_long = en_operacion and (direccion == 1) and (low[i] <= sl_activo)
         raw_sl_short = en_operacion and (direccion == -1) and (high[i] >= sl_activo)
         raw_sl = raw_sl_long or raw_sl_short
@@ -373,16 +396,24 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
             barras_desde_sl = 0
             if es_dia_actual:
                 eventos_hoy.append({
-                    "ts": ts, "tipo": "SL", "par": symbol,
-                    "entrada": precio_entrada, "salida": sl_activo, "pnl": -RIESGO_USD
+                    "ts": ts,
+                    "tipo": "SL",
+                    "par": symbol,
+                    "entrada": precio_entrada,
+                    "salida": sl_activo,
+                    "pnl": -RIESGO_USD
                 })
         else:
             barras_desde_sl += 1
 
         if be_tocado and es_dia_actual:
             eventos_hoy.append({
-                "ts": ts, "tipo": "BE", "par": symbol,
-                "entrada": precio_entrada, "salida": precio_entrada, "pnl": 0.0
+                "ts": ts,
+                "tipo": "BE",
+                "par": symbol,
+                "entrada": precio_entrada,
+                "salida": precio_entrada,
+                "pnl": 0.0
             })
 
         if tp1_tocado:
@@ -391,14 +422,22 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
             ult_dir_sl = 0
             if es_dia_actual:
                 eventos_hoy.append({
-                    "ts": ts, "tipo": "TP1", "par": symbol,
-                    "entrada": precio_entrada, "salida": tp1_activo, "pnl": ganancia_mitad1
+                    "ts": ts,
+                    "tipo": "TP1",
+                    "par": symbol,
+                    "entrada": precio_entrada,
+                    "salida": tp1_activo,
+                    "pnl": ganancia_mitad1
                 })
 
         if tp2_tocado and es_dia_actual:
             eventos_hoy.append({
-                "ts": ts, "tipo": "TP2", "par": symbol,
-                "entrada": precio_entrada, "salida": tp2_activo, "pnl": ganancia_mitad2
+                "ts": ts,
+                "tipo": "TP2",
+                "par": symbol,
+                "entrada": precio_entrada,
+                "salida": tp2_activo,
+                "pnl": ganancia_mitad2
             })
 
         pnl_cambio = (-RIESGO_USD if sl_tocado else 0.0) + (ganancia_mitad1 if tp1_tocado else 0.0) + (ganancia_mitad2 if tp2_tocado else 0.0)
@@ -410,6 +449,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
         en_operacion = False if fin_op else en_operacion
         direccion = 0 if fin_op else direccion
 
+        # Logica de entrada V3.7 Final
         separacion_emas = abs(ema9[i] - ema21[i]) >= (atr[i] * 0.12)
         fuerza_tendencia = (adx_val[i] >= ADX_MIN) and separacion_emas
         pendiente_alcista = (ema9[i] > ema9[i - 2]) and (ema21[i] > ema21[i - 2])
@@ -486,6 +526,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4):
                     "lotaje": pos_size
                 })
 
+    # Evaluacion del estado visual en la ultima vela cerrada
     i_ult = len(df5) - 1
     sep_ult = abs(ema9[i_ult] - ema21[i_ult]) >= (atr[i_ult] * 0.12)
     fuerza_ult = (adx_val[i_ult] >= ADX_MIN) and sep_ult
@@ -560,21 +601,34 @@ def formatear_alerta_evento(ev):
     )
 
 
+# ==============================================================================
+# 5. BUCLE PRINCIPAL DE EJECUCION Y FILTROS DE NOTIFICACION
+# ==============================================================================
 def main():
     ahora_utc4 = datetime.now(TZ_UTC4)
     fecha_str = ahora_utc4.strftime("%Y-%m-%d")
+    hora_str = ahora_utc4.strftime("%Y-%m-%d_%H")
     fecha_humana = ahora_utc4.strftime("%d/%m/%Y | %H:%M UTC-4")
     fecha_hoy_utc4 = ahora_utc4.date()
 
-    es_manual = (EVENT_NAME == "workflow_dispatch")
-    en_horario_operativo = (HORA_INICIO <= ahora_utc4.hour < HORA_FIN)
-    es_hora_cierre = (ahora_utc4.hour >= HORA_FIN)
+    # Silencio en fines de semana si OPERAR_FINDE es False
+    if not OPERAR_FINDE and ahora_utc4.weekday() in (5, 6):
+        return
 
     estado = cargar_estado()
-    hubo_cambios = False
 
-    if ahora_utc4.hour < HORA_INICIO and not es_manual:
+    # --------------------------------------------------------------------------
+    # COMPUERTA 1: HORARIO OPERATIVO ESTRICTO (SILENCIO FUERA DE 08:00 - 22:00)
+    # --------------------------------------------------------------------------
+    if ahora_utc4.hour < HORA_INICIO:
         return
+
+    if ahora_utc4.hour >= HORA_FIN and estado.get("ultimo_cierre_dia") == fecha_str:
+        return
+
+    en_horario_operativo = (HORA_INICIO <= ahora_utc4.hour < HORA_FIN)
+    es_hora_cierre = (ahora_utc4.hour >= HORA_FIN)
+    hubo_cambios = False
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         resultados = list(executor.map(lambda s: analizar_moneda(s, fecha_hoy_utc4), SYMBOLS))
@@ -583,6 +637,9 @@ def main():
     if not resultados:
         return
 
+    # --------------------------------------------------------------------------
+    # COMPUERTA 2: ALERTAS OPERATIVAS DE ALTA PRIORIDAD (TIEMPO REAL CADA 5 MIN)
+    # --------------------------------------------------------------------------
     ultimo_ts_map = estado.setdefault("ultimo_ts_evento", {})
     for res in resultados:
         sym = res["symbol"]
@@ -596,7 +653,10 @@ def main():
                     hubo_cambios = True
                     time.sleep(0.4)
 
-    if (en_horario_operativo and estado.get("ultimo_resumen_dia") != fecha_str) or es_manual:
+    # --------------------------------------------------------------------------
+    # COMPUERTA 3: ESTADO DE SESION / HEARTBEAT (BAJA PRIORIDAD: 1 VEZ POR HORA)
+    # --------------------------------------------------------------------------
+    if en_horario_operativo and estado.get("ultima_hora_resumen") != hora_str:
         lineas = [
             f"<b>{VERSION}</b>",
             f"<b>Estado de Sesión</b> ({fecha_humana})\n"
@@ -608,11 +668,13 @@ def main():
                 f"| Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({signo}${abs(r['pnl_hoy']):.0f})"
             )
         if enviar_telegram("\n".join(lineas)):
-            if en_horario_operativo:
-                estado["ultimo_resumen_dia"] = fecha_str
-                hubo_cambios = True
+            estado["ultima_hora_resumen"] = hora_str
+            hubo_cambios = True
 
-    if es_hora_cierre and (estado.get("ultimo_cierre_dia") != fecha_str or es_manual):
+    # --------------------------------------------------------------------------
+    # COMPUERTA 4: REPORTE DE CIERRE DIARIO A LAS 22:00 UTC-4 Y CONGELAMIENTO
+    # --------------------------------------------------------------------------
+    if es_hora_cierre and estado.get("ultimo_cierre_dia") != fecha_str:
         total_w = sum(r["w_hoy"] for r in resultados)
         total_l = sum(r["l_hoy"] for r in resultados)
         total_trades = total_w + total_l
