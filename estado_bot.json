@@ -1,13 +1,8 @@
 {
-  "motor": "pine_v37_clone",
-  "ultimo_resumen_dia": "2026-11-05",
-  "ultimo_cierre_dia": "2026-11-06",
-  "ultimo_ts_evento": {
-    "BTCUSDT": 1793920200000,
-    "ETHUSDT": 1794007800000,
-    "ZECUSDT": 1794010800000,
-    "XAGUSDT": 1793976300000,
-    "SOLUSDT": 1793923200000
-  },
-  "ultima_hora_resumen": "2026-11-06_21"
+  "motor": "pine_v384_clone",
+  "ultima_hora_resumen": "2026-11-08_15",
+  "ultimo_cierre_dia": "",
+  "ultimo_ts_evento": {},
+  "operar_finde_activo": false,
+  "last_update_id": 941241187
 }
