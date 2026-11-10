@@ -33,18 +33,21 @@ jobs:
       - name: Instalar librerias necesarias
         run: pip install -q requests pandas numpy urllib3
 
-      - name: Ejecutar Bot D-Scalp V3.7
+      - name: Ejecutar Bot D-Scalp V3.8.6
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GITHUB_EVENT_NAME: ${{ github.event.inputs.origen == 'auto' && 'schedule' || github.event_name }}
         run: python bot.py
 
-      - name: Persistir estado de alertas
+      - name: Persistir estado de alertas y bitacora CSV
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -f estado_bot.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
             git add estado_bot.json
-            git diff --staged --quiet || (git commit -m "chore: update bot state [skip ci]" && git push)
           fi
+          if [ -f bitacora_dscalp.csv ]; then
+            git add bitacora_dscalp.csv
+          fi
+          git diff --staged --quiet || (git commit -m "chore: update bot state and journal [skip ci]" && git push)
