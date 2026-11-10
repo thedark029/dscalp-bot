@@ -1,1 +1,2 @@
 ID_Trade,Fecha_Entrada,Fecha_Salida,Ticker,Direccion,Entrada,Salida,SL_Inicial,TP1,TP2,Lotaje,NATR_Mult,ADX_Entrada,Resultado,PnL_USDT,R_Multiple,Balance_USD
+#001,2026-11-10 08:05,2026-11-10 08:55,ETHUSDT,SHORT,2090.8,2097.3,2097.3,2077.7,2064.6,0.306,1.50x,33.9,SL,-2.00,-1.00R,88.00
