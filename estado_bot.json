@@ -4,7 +4,7 @@
   "ultimo_cierre_dia": "2026-11-09",
   "ultimo_ts_evento": {
     "BTCUSDT": 1794270600000,
-    "BNBUSDT": 1794320100000,
+    "BNBUSDT": 1794321300000,
     "XAGUSDT": 1794321000000,
     "XAUTUSDT": 1794320700000,
     "ZECUSDT": 1794252900000,
@@ -12,7 +12,7 @@
   },
   "operar_finde_activo": false,
   "last_update_id": 0,
-  "capital_acumulado": 90.0,
+  "capital_acumulado": 88.0,
   "trades_registrados": [
     "XAGUSDT_1794226500000",
     "XAUTUSDT_1794249600000",
@@ -22,6 +22,7 @@
     "BTCUSDT_1794266100000",
     "BNBUSDT_1794257100000",
     "ETHUSDT_1794312300000",
-    "BNBUSDT_1794312000000"
+    "BNBUSDT_1794312000000",
+    "BNBUSDT_1794320100000"
   ]
 }
