@@ -6,7 +6,7 @@
     "BTCUSDT": 1794349200000,
     "BNBUSDT": 1794335400000,
     "XAGUSDT": 1794322800000,
-    "XAUTUSDT": 1794327600000,
+    "XAUTUSDT": 1794361200000,
     "ZECUSDT": 1794359700000,
     "ETHUSDT": 1794315300000,
     "XRPUSDT": 1794331800000,
@@ -14,7 +14,7 @@
   },
   "operar_finde_activo": false,
   "last_update_id": 0,
-  "capital_acumulado": 74.0,
+  "capital_acumulado": 76.0,
   "trades_registrados": [
     "XAGUSDT_1794226500000",
     "XAUTUSDT_1794249600000",
@@ -32,6 +32,7 @@
     "SOLUSDT_1794332100000",
     "BNBUSDT_1794334200000",
     "ZECUSDT_1794334200000",
-    "BTCUSDT_1794348300000"
+    "BTCUSDT_1794348300000",
+    "XAUTUSDT_1794320700000"
   ]
 }
