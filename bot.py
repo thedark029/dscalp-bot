@@ -3,11 +3,16 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 1. PARAMETROS GLOBALES V3.8.6 MULTI-ASSET
+# ==============================================================================
+# 1. PARAMETROS GLOBALES V3.8.6 MULTI-ASSET (SIN CIRCUIT BREAKER GLOBAL)
+# ==============================================================================
 VERSION = "D-SCALP V3.8.6"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "XAGUSDT", "XAUTUSDT", "ZECUSDT"]
 
@@ -15,6 +20,7 @@ CAPITAL_INICIAL = 100.0
 RIESGO_PORC = 2.0
 RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
 MAX_DERROTAS = 3
+TAKER_FEE = 0.0006  # 0.06% Taker Fee por orden (0.12% redondo apertura + cierre)
 
 AUTO_DETECT = True
 MULTIPLICADOR_ATR_MAN = 1.5
@@ -43,6 +49,7 @@ HORA_FIN = 22
 
 STATE_FILE = "estado_bot.json"
 BITACORA_FILE = "bitacora_dscalp.csv"
+EXCEL_FILE = "Bitacora_DScalp_PRO.xlsx"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
@@ -50,18 +57,39 @@ TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.6"})
 
+# 23 Columnas Auditadas (Sin MFE/MAE opcionales y con Numeros Puros)
 ENCABEZADOS_BITACORA = [
-    "ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Ticker", "Direccion",
-    "Entrada", "Salida", "SL_Inicial", "TP1", "TP2", "Lotaje",
-    "NATR_Mult", "ADX_Entrada", "Resultado", "PnL_USDT", "R_Multiple", "Balance_USD"
+    "ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Duracion_Min", "Sesion",
+    "Ticker", "Direccion", "Entrada", "Salida_Prom_Ponderada", "SL_Inicial",
+    "Distancia_SL_%", "TP1", "TP2", "Lotaje", "Valor_Nocional",
+    "NATR_Mult", "ADX_Entr", "Resultado", "PnL_USDT", "Comision_USDT",
+    "PnL_Neto", "R_Multiple", "Balance_USD"
 ]
 
 
-# 2. MOTOR DE BITACORA CSV Y PERSISTENCIA
+# ==============================================================================
+# 2. MOTOR CONTABLE CSV Y ARQUITECTURA DE EXCEL (.XLSX) CON KPIS EN FILAS 1-4
+# ==============================================================================
+def clasificar_sesion(hora_local):
+    if 8 <= hora_local < 13:
+        return "NY Open"
+    elif hora_local < 8:
+        return "Londres/Asia"
+    return "NY Tarde"
+
+
 def asegurar_archivo_bitacora():
-    if not os.path.exists(BITACORA_FILE):
-        with open(BITACORA_FILE, mode="w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(ENCABEZADOS_BITACORA)
+    if os.path.exists(BITACORA_FILE):
+        try:
+            with open(BITACORA_FILE, mode="r", encoding="utf-8") as f:
+                primera = f.readline().strip().split(",")
+                if primera == ENCABEZADOS_BITACORA:
+                    return True
+        except Exception:
+            pass
+    with open(BITACORA_FILE, mode="w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(ENCABEZADOS_BITACORA)
+    return False
 
 
 def contar_trades_bitacora():
@@ -75,25 +103,275 @@ def registrar_trade_en_csv(trade, capital_actual):
     with open(BITACORA_FILE, mode="r", encoding="utf-8") as f:
         total_filas = sum(1 for _ in f)
     trade_id = f"#{max(1, total_filas):03d}"
-    balance_nuevo = round(capital_actual + float(trade["pnl_usdt"]), 2)
+
+    dt_ent = datetime.fromtimestamp(int(trade["ts_entrada"]) / 1000.0, tz=TZ_UTC4)
+    dt_sal = datetime.fromtimestamp(int(trade["ts_salida"]) / 1000.0, tz=TZ_UTC4)
+
+    # Formato corto dd/mm HH:MM para evitar ########## en WPS Office
+    f_ent = dt_ent.strftime("%d/%m %H:%M")
+    f_sal = dt_sal.strftime("%d/%m %H:%M")
+    duracion_min = max(1, int(round((int(trade["ts_salida"]) - int(trade["ts_entrada"])) / 60000.0)))
+    sesion = clasificar_sesion(dt_ent.hour)
 
     p_ent = float(trade["precio_entrada"])
-    fmt_dec = ".4f" if p_ent < 10.0 else (".1f" if p_ent >= 1000.0 else ".2f")
-    f_ent = datetime.fromtimestamp(int(trade["ts_entrada"]) / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d %H:%M")
-    f_sal = datetime.fromtimestamp(int(trade["ts_salida"]) / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d %H:%M")
+    p_sal_prom = float(trade["precio_salida_prom"])
+    sl_ini = float(trade["sl_inicial"])
+    tp1 = float(trade["tp1"])
+    tp2 = float(trade["tp2"])
+    lotaje = float(trade["lotaje"])
+
+    dist_sl_pct = abs(p_ent - sl_ini) / p_ent if p_ent > 0 else 0.0
+    valor_nocional = p_ent * lotaje
+    comision_usdt = (p_ent * lotaje + p_sal_prom * lotaje) * TAKER_FEE
+    pnl_bruto = float(trade["pnl_bruto"])
+    pnl_neto = pnl_bruto - comision_usdt
+    r_mult = float(trade["r_mult"])
+    balance_nuevo = round(capital_actual + pnl_neto, 2)
+
+    dec = 4 if p_ent < 10.0 else (1 if p_ent >= 1000.0 else 2)
 
     with open(BITACORA_FILE, mode="a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            trade_id, f_ent, f_sal, trade["ticker"], trade["direccion"],
-            f"{trade['precio_entrada']:{fmt_dec}}", f"{trade['precio_salida']:{fmt_dec}}",
-            f"{trade['sl_inicial']:{fmt_dec}}", f"{trade['tp1']:{fmt_dec}}", f"{trade['tp2']:{fmt_dec}}",
-            f"{trade['lotaje']:.3f}", f"{trade['natr_mult']:.2f}x", f"{trade['adx_entrada']:.1f}",
-            trade["resultado"], f"{trade['pnl_usdt']:+.2f}", f"{trade['r_mult']:+.2f}R", f"{balance_nuevo:.2f}"
+            trade_id,
+            f_ent,
+            f_sal,
+            duracion_min,
+            sesion,
+            trade["ticker"],
+            trade["direccion"],
+            round(p_ent, dec),
+            round(p_sal_prom, dec),
+            round(sl_ini, dec),
+            round(dist_sl_pct, 5),
+            round(tp1, dec),
+            round(tp2, dec),
+            round(lotaje, 3),
+            round(valor_nocional, 2),
+            round(float(trade["natr_mult"]), 2),
+            round(float(trade["adx_entrada"]), 1),
+            trade["resultado"],
+            round(pnl_bruto, 2),
+            round(comision_usdt, 2),
+            round(pnl_neto, 2),
+            round(r_mult, 2),
+            round(balance_nuevo, 2)
         ])
     return balance_nuevo, trade_id
 
 
-# 3. TELEGRAM, BOTONES Y DOCUMENTOS
+def generar_excel_profesional():
+    """Compila Bitacora_DScalp_PRO.xlsx con KPIs (Filas 1-4), Freeze Panes y Semaforo."""
+    asegurar_archivo_bitacora()
+    df = pd.read_csv(BITACORA_FILE)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bitacora_DScalp"
+    ws.views.sheetView[0].showGridLines = True
+
+    # Paleta de estilos institucionales
+    fill_header_kpi = PatternFill("solid", fgColor="111827")
+    fill_kpi_box = PatternFill("solid", fgColor="1F2937")
+    fill_th = PatternFill("solid", fgColor="0F172A")
+    fill_tp2 = PatternFill("solid", fgColor="D1FAE5")     # Verde esmeralda suave
+    fill_tp1_be = PatternFill("solid", fgColor="DBEAFE")  # Azul suave para TP1+BE
+    fill_sl = PatternFill("solid", fgColor="FEE2E2")      # Rojo suave para SL
+    fill_warn = PatternFill("solid", fgColor="FEF3C7")    # Alerta ambar para ADX > 35 o Micro-Stop
+
+    font_title = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    font_kpi_lbl = Font(name="Calibri", size=9, bold=True, color="9CA3AF")
+    font_kpi_val = Font(name="Calibri", size=10, bold=True, color="38BDF8")
+    font_th = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    font_data = Font(name="Calibri", size=10, color="111827")
+    font_tp2 = Font(name="Calibri", size=10, bold=True, color="065F46")
+    font_be = Font(name="Calibri", size=10, bold=True, color="1E40AF")
+    font_sl = Font(name="Calibri", size=10, bold=True, color="991B1B")
+    font_warn = Font(name="Calibri", size=10, bold=True, color="B45309")
+
+    borde_fino = Border(
+        left=Side(style="thin", color="D1D5DB"),
+        right=Side(style="thin", color="D1D5DB"),
+        top=Side(style="thin", color="D1D5DB"),
+        bottom=Side(style="thin", color="D1D5DB")
+    )
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+
+    # Calculo de KPIs Superiores (Filas 1 a 4)
+    total_trades = len(df)
+    if total_trades > 0:
+        wins = df[df["Resultado"].astype(str).str.startswith("TP")]
+        wr_real = (len(wins) / total_trades) * 100.0
+        exp_r = df["R_Multiple"].astype(float).mean()
+        pnl_bruto_tot = df["PnL_USDT"].astype(float).sum()
+        com_tot = df["Comision_USDT"].astype(float).sum()
+        pnl_neto_tot = df["PnL_Neto"].astype(float).sum()
+        bal_actual = df["Balance_USD"].astype(float).iloc[-1]
+
+        gan_netas = df[df["PnL_Neto"].astype(float) > 0]["PnL_Neto"].astype(float).sum()
+        perd_netas = abs(df[df["PnL_Neto"].astype(float) < 0]["PnL_Neto"].astype(float).sum())
+        pf_neto = (gan_netas / perd_netas) if perd_netas > 0 else gan_netas
+
+        curva = [CAPITAL_INICIAL] + df["Balance_USD"].astype(float).tolist()
+        pico = CAPITAL_INICIAL
+        max_dd = 0.0
+        for b in curva:
+            if b > pico:
+                pico = b
+            dd = pico - b
+            if dd > max_dd:
+                max_dd = dd
+
+        # Auditoria de ADX: Rango Optimo (20-32) vs Agotamiento (> 35)
+        adx_col = df["ADX_Entr"].astype(float)
+        df_adx_20_32 = df[(adx_col >= 20.0) & (adx_col <= 32.0)]
+        df_adx_gt_35 = df[adx_col > 35.0]
+        wr_adx_20_32 = (len(df_adx_20_32[df_adx_20_32["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_20_32) * 100.0) if len(df_adx_20_32) > 0 else 0.0
+        wr_adx_gt_35 = (len(df_adx_gt_35[df_adx_gt_35["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_gt_35) * 100.0) if len(df_adx_gt_35) > 0 else 0.0
+        n_20_32, n_gt_35 = len(df_adx_20_32), len(df_adx_gt_35)
+    else:
+        wr_real = exp_r = pnl_bruto_tot = com_tot = pnl_neto_tot = pf_neto = max_dd = wr_adx_20_32 = wr_adx_gt_35 = 0.0
+        bal_actual = CAPITAL_INICIAL
+        n_20_32 = n_gt_35 = 0
+
+    # FILA 1: Titulo Principal
+    ws.merge_cells("A1:W1")
+    ws["A1"] = f"⚡ {VERSION} — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)"
+    ws["A1"].font = font_title
+    ws["A1"].fill = fill_header_kpi
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 24
+
+    # FILAS 2 a 4: Bloque Superior de KPIs
+    kpis_f2 = [
+        ("A2:B2", "Capital Inicial:", "C2:D2", f"${CAPITAL_INICIAL:.2f}"),
+        ("E2:F2", "Balance Neto Real:", "G2:H2", f"${bal_actual:.2f}"),
+        ("I2:J2", "Win Rate Real (%):", "K2:L2", f"{wr_real:.1f}% ({total_trades} ops)"),
+        ("M2:N2", "Expectativa (en R):", "O2:P2", f"{exp_r:+.2f}R"),
+        ("Q2:S2", "Profit Factor Neto:", "T2:W2", f"{pf_neto:.2f}")
+    ]
+    kpis_f3 = [
+        ("A3:B3", "PnL Bruto Acum.:", "C3:D3", f"{pnl_bruto_tot:+.2f} USDT"),
+        ("E3:F3", "Comisiones (0.12%):", "G3:H3", f"-${com_tot:.2f} USDT"),
+        ("I3:J3", "PnL Neto Real:", "K3:L3", f"{pnl_neto_tot:+.2f} USDT"),
+        ("M3:O3", "Max Drawdown ($):", "P3:W3", f"-${max_dd:.2f} USD")
+    ]
+    kpis_f4 = [
+        ("A4:D4", "Win Rate ADX 20–32 (Zona Óptima):", "E4:H4", f"{wr_adx_20_32:.1f}% WR ({n_20_32} ops)"),
+        ("I4:L4", "Win Rate ADX > 35 (Agotamiento):", "M4:P4", f"{wr_adx_gt_35:.1f}% WR ({n_gt_35} ops)"),
+        ("Q4:W4", "Alerta Micro-Stop: < 0.25% Cripto | < 0.15% Metales", None, None)
+    ]
+
+    for row_idx, kpi_list in [(2, kpis_f2), (3, kpis_f3), (4, kpis_f4)]:
+        ws.row_dimensions[row_idx].height = 20
+        for rng_lbl, txt_lbl, rng_val, txt_val in kpi_list:
+            ws.merge_cells(rng_lbl)
+            c_lbl = ws[rng_lbl.split(":")[0]]
+            c_lbl.value = txt_lbl
+            c_lbl.font = font_kpi_lbl
+            c_lbl.fill = fill_kpi_box
+            c_lbl.alignment = center
+            if rng_val:
+                ws.merge_cells(rng_val)
+                c_val = ws[rng_val.split(":")[0]]
+                c_val.value = txt_val
+                c_val.font = font_kpi_val
+                c_val.fill = fill_kpi_box
+                c_val.alignment = center
+
+    # FILA 5: Encabezados de la Tabla
+    ws.row_dimensions[5].height = 22
+    for col_idx, h_text in enumerate(ENCABEZADOS_BITACORA, start=1):
+        cell = ws.cell(row=5, column=col_idx, value=h_text)
+        cell.font = font_th
+        cell.fill = fill_th
+        cell.alignment = center
+        cell.border = borde_fino
+
+    # Inmovilizar las 4 filas de KPIs + fila 5 de encabezados (Freeze Panes en A6)
+    ws.freeze_panes = "A6"
+
+    # FILA 6+: Datos con Formatos Numericos Personalizados y Semaforo Condicional
+    for r_idx, row in df.iterrows():
+        excel_r = r_idx + 6
+        ws.row_dimensions[excel_r].height = 19
+        res_str = str(row["Resultado"])
+        tk_str = str(row["Ticker"])
+        es_metal_row = ("XAU" in tk_str) or ("XAG" in tk_str)
+
+        for c_idx, col_name in enumerate(ENCABEZADOS_BITACORA, start=1):
+            val = row[col_name]
+            cell = ws.cell(row=excel_r, column=c_idx, value=val)
+            cell.font = font_data
+            cell.border = borde_fino
+
+            if col_name in ("ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Sesion", "Ticker", "Direccion", "Resultado"):
+                cell.alignment = center
+            elif col_name == "Duracion_Min":
+                cell.number_format = '0" min"'
+                cell.alignment = right
+            elif col_name in ("Entrada", "Salida_Prom_Ponderada", "SL_Inicial", "TP1", "TP2"):
+                p_ref = float(row["Entrada"])
+                cell.number_format = "0.0000" if p_ref < 10.0 else ("0.0" if p_ref >= 1000.0 else "0.00")
+                cell.alignment = right
+            elif col_name == "Distancia_SL_%":
+                cell.number_format = "0.00%"
+                cell.alignment = right
+                umbral_micro = 0.0015 if es_metal_row else 0.0025
+                if float(val) < umbral_micro:
+                    cell.fill = fill_warn
+                    cell.font = font_warn
+            elif col_name == "Lotaje":
+                cell.number_format = "0.000"
+                cell.alignment = right
+            elif col_name in ("Valor_Nocional", "Comision_USDT", "Balance_USD"):
+                cell.number_format = "$#,##0.00"
+                cell.alignment = right
+            elif col_name in ("PnL_USDT", "PnL_Neto"):
+                cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
+                cell.alignment = right
+            elif col_name == "NATR_Mult":
+                cell.number_format = '0.00"x"'
+                cell.alignment = right
+            elif col_name == "ADX_Entr":
+                cell.number_format = "0.0"
+                cell.alignment = right
+                if float(val) > 35.0:
+                    cell.fill = fill_warn
+                    cell.font = font_warn
+            elif col_name == "R_Multiple":
+                cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
+                cell.alignment = right
+
+            # Semaforo visual en Resultado, PnL_USDT, PnL_Neto y R_Multiple
+            if col_name in ("Resultado", "PnL_USDT", "PnL_Neto", "R_Multiple"):
+                if res_str == "TP2":
+                    cell.fill = fill_tp2
+                    cell.font = font_tp2
+                elif res_str == "TP1+BE":
+                    cell.fill = fill_tp1_be
+                    cell.font = font_be
+                elif res_str == "SL":
+                    cell.fill = fill_sl
+                    cell.font = font_sl
+
+    # Ancho de columnas calibrado para evitar ########## en WPS Office y Excel
+    anchos_columnas = {
+        1: 10, 2: 15, 3: 15, 4: 13, 5: 13, 6: 12, 7: 10,
+        8: 12, 9: 20, 10: 12, 11: 15, 12: 12, 13: 12, 14: 11,
+        15: 15, 16: 12, 17: 12, 18: 12, 19: 13, 20: 14, 21: 13, 22: 12, 23: 14
+    }
+    for col_idx in range(1, len(ENCABEZADOS_BITACORA) + 1):
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = anchos_columnas.get(col_idx, 13)
+
+    wb.save(EXCEL_FILE)
+    return EXCEL_FILE
+
+
+# ==============================================================================
+# 3. TELEGRAM, BOTONES Y ENVIO DE DOCUMENTO EXCEL (.XLSX)
+# ==============================================================================
 def fmt_p(val):
     if val is None or np.isnan(val):
         return "--"
@@ -114,7 +392,7 @@ def obtener_teclado_telegram(operar_finde_activo):
             ],
             [
                 {"text": "📊 Estado Ahora", "callback_data": "cmd_estado_actual"},
-                {"text": "📥 Bitácora CSV", "callback_data": "cmd_bitacora_csv"}
+                {"text": "📥 Bitácora Excel", "callback_data": "cmd_bitacora_csv"}
             ]
         ]
     }
@@ -142,19 +420,20 @@ def enviar_telegram(texto, con_botones=False, operar_finde_activo=False):
 def enviar_documento_bitacora(capital_actual, w_hoy, l_hoy, pnl_hoy, operar_finde_activo):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
-    asegurar_archivo_bitacora()
+    generar_excel_profesional()
     total_regs = contar_trades_bitacora()
     s_hoy = "+" if pnl_hoy >= 0 else "-"
     caption = (
-        f"📊 <b>Bitácora Automatizada {VERSION}</b>\n"
+        f"📊 <b>Bitácora Cuantitativa {VERSION} (.XLSX)</b>\n"
         f"• <b>Trades registrados:</b> {total_regs}\n"
-        f"• <b>Balance Acumulado:</b> ${capital_actual:.2f} USDT\n"
-        f"• <b>Sesión Hoy:</b> {w_hoy}G - {l_hoy}P ({s_hoy}${abs(pnl_hoy):.2f} USDT)"
+        f"• <b>Balance Neto Real:</b> ${capital_actual:.2f} USDT\n"
+        f"• <b>Sesión Hoy:</b> {w_hoy}G - {l_hoy}P ({s_hoy}${abs(pnl_hoy):.2f} USDT)\n"
+        f"<i>Con KPIs fijos (Filas 1-4), Salida Ponderada, Comisiones 0.12% y Auditoría ADX 20-32 vs >35.</i>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
-        with open(BITACORA_FILE, "rb") as doc:
-            files = {"document": ("Bitacora_DScalp_PRO.csv", doc, "text/csv")}
+        with open(EXCEL_FILE, "rb") as doc:
+            files = {"document": (EXCEL_FILE, doc, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
             data = {
                 "chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
                 "reply_markup": json.dumps(obtener_teclado_telegram(operar_finde_activo))
@@ -173,20 +452,19 @@ def responder_callback(cb_id, texto=""):
 
 
 def cargar_estado():
-    asegurar_archivo_bitacora()
+    esquema_intacto = asegurar_archivo_bitacora()
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                if d.get("motor") in ("pine_v385_clone", "pine_v386_clone"):
-                    d["motor"] = "pine_v386_clone"
+                if d.get("motor") == "pine_v386_excel_v3" and esquema_intacto:
                     d.setdefault("capital_acumulado", CAPITAL_INICIAL)
                     d.setdefault("trades_registrados", [])
                     return d
         except Exception:
             pass
     return {
-        "motor": "pine_v386_clone", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
+        "motor": "pine_v386_excel_v3", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
         "ultimo_ts_evento": {}, "operar_finde_activo": OPERAR_FINDE_DEFAULT,
         "last_update_id": 0, "capital_acumulado": CAPITAL_INICIAL, "trades_registrados": []
     }
@@ -194,7 +472,7 @@ def cargar_estado():
 
 def guardar_estado(estado):
     try:
-        estado["motor"] = "pine_v386_clone"
+        estado["motor"] = "pine_v386_excel_v3"
         if len(estado.get("trades_registrados", [])) > 500:
             estado["trades_registrados"] = estado["trades_registrados"][-500:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -219,7 +497,7 @@ def leer_comandos_telegram(estado):
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 if str(cb.get("message", {}).get("chat", {}).get("id", "")) == str(CHAT_ID):
-                    responder_callback(cb.get("id"), "Procesando en D-Scalp V3.8.6...")
+                    responder_callback(cb.get("id"), "Generando Bitácora Excel Pro...")
                     acciones.append(cb.get("data", ""))
             elif "message" in upd:
                 msg = upd["message"]
@@ -238,7 +516,9 @@ def leer_comandos_telegram(estado):
     return acciones
 
 
+# ==============================================================================
 # 4. DATOS DE MERCADO Y FUNCIONES PINE SCRIPT V6
+# ==============================================================================
 def fetch_klines(symbol, granularity="5m", total_candles=1000):
     url = "https://api.bitget.com/api/v2/mix/market/candles"
     frames, end_time, needed = [], None, total_candles
@@ -352,7 +632,9 @@ def obtener_config_activo(symbol):
     return cfg_atr, cfg_adx, r_tp1, r_tp2, (NATR_MIN_SC if es_est else 0.95), (NATR_MAX_SC if es_est else 1.25), es_metal
 
 
+# ==============================================================================
 # 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.6
+# ==============================================================================
 def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     df5, df15, df30 = fetch_klines(symbol, "5m", 1000), fetch_klines(symbol, "15m", 400), fetch_klines(symbol, "30m", 400)
     if df5.empty or len(df5) < 150:
@@ -408,6 +690,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         ts = int(ts_arr[i])
         dt_loc = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
         es_hoy = (dt_loc.date() == fecha_hoy_utc4)
+        es_reciente_bitacora = ((fecha_hoy_utc4 - dt_loc.date()).days <= 2)
 
         min_r, max_r = np.min(low[i - 12:i]), np.max(high[i - 12:i])
         b_alc = (low[i] < min_r) and (close[i] > min_r) and ((min(open_p[i], close[i]) - low[i]) > atr[i] * 0.35)
@@ -476,16 +759,30 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         pnl_hoy += (-RIESGO_USD if sl_toc else 0.0) + (gan1 if tp1_toc else 0.0) + (gan2 if tp2_toc else 0.0)
         fin_op = raw_sl or tp2_toc
 
-        if fin_op and es_hoy:
-            res_lbl = "TP2" if tp2_toc else ("TP1+BE" if be_toc else "SL")
-            p_sal = tp2_act if tp2_toc else (p_ent if be_toc else sl_ini)
-            pnl_op = (gan1 + gan2) if tp2_toc else (gan1 if be_toc else -RIESGO_USD)
-            r_op = ((0.5 * r_tp1) + (0.5 * r_tp2)) if tp2_toc else ((0.5 * r_tp1) if be_toc else -1.0)
+        # Registro de trades cerrados con Precio de Salida Promedio Ponderado
+        if fin_op and es_reciente_bitacora:
+            if tp2_toc:
+                res_lbl = "TP2"
+                p_sal_prom = (tp1_act * 0.5) + (tp2_act * 0.5)
+                pnl_op = gan1 + gan2
+                r_op = (0.5 * r_tp1) + (0.5 * r_tp2)
+            elif be_toc:
+                res_lbl = "TP1+BE"
+                p_sal_prom = (tp1_act * 0.5) + (p_ent * 0.5)
+                pnl_op = gan1
+                r_op = 0.5 * r_tp1
+            else:
+                res_lbl = "SL"
+                p_sal_prom = sl_ini
+                pnl_op = -RIESGO_USD
+                r_op = -1.0
+
             trades_cerrados.append({
                 "uid": f"{symbol}_{ts_ent_op}", "ts_entrada": ts_ent_op, "ts_salida": ts, "ticker": symbol,
-                "direccion": "LONG" if direccion == 1 else "SHORT", "precio_entrada": p_ent, "precio_salida": p_sal,
-                "sl_inicial": sl_ini, "tp1": tp1_act, "tp2": tp2_act, "lotaje": pos_sz,
-                "natr_mult": dyn_op, "adx_entrada": adx_op, "resultado": res_lbl, "pnl_usdt": pnl_op, "r_mult": r_op
+                "direccion": "LONG" if direccion == 1 else "SHORT", "precio_entrada": p_ent,
+                "precio_salida_prom": p_sal_prom, "sl_inicial": sl_ini, "tp1": tp1_act, "tp2": tp2_act,
+                "lotaje": pos_sz, "natr_mult": dyn_op, "adx_entrada": adx_op,
+                "resultado": res_lbl, "pnl_bruto": pnl_op, "r_mult": r_op
             })
 
         tp1_hit = False if fin_op else (True if tp1_toc else tp1_hit)
@@ -599,7 +896,7 @@ def formatear_alerta_evento(ev):
     return (
         f"<b>{VERSION}</b>\n<b>Par:</b> {par}\n<b>Evento:</b> {etiq.get(t, t)}\n"
         f"<b>Entrada:</b> {fmt_p(ev['entrada'])} | <b>Salida:</b> {fmt_p(ev['salida'])}\n"
-        f"<b>PnL:</b> {s}${abs(ev['pnl']):.2f} USD\n<b>Fecha/Hora:</b> {fh}"
+        f"<b>PnL Bruto:</b> {s}${abs(ev['pnl']):.2f} USD\n<b>Fecha/Hora:</b> {fh}"
     )
 
 
@@ -629,7 +926,9 @@ def enviar_reporte_finde(fecha_hoy_utc4, operar_finde_activo):
     enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=operar_finde_activo)
 
 
+# ==============================================================================
 # 6. BUCLE PRINCIPAL DE EJECUCION
+# ==============================================================================
 def main():
     ahora = datetime.now(TZ_UTC4)
     f_str, h_str = ahora.strftime("%Y-%m-%d"), ahora.strftime("%Y-%m-%d_%H")
@@ -688,12 +987,17 @@ def main():
         cerrados.extend(r.get("trades_cerrados", []))
     cerrados.sort(key=lambda x: x["ts_salida"])
 
+    hubo_nuevos_trades = False
     for tr in cerrados:
         if tr["uid"] not in trades_reg:
             cap_acum, _ = registrar_trade_en_csv(tr, cap_acum)
             trades_reg.append(tr["uid"])
             estado["capital_acumulado"] = cap_acum
             cambios = True
+            hubo_nuevos_trades = True
+
+    if hubo_nuevos_trades or (not os.path.exists(EXCEL_FILE)):
+        generar_excel_profesional()
 
     if enviar_csv:
         enviar_documento_bitacora(cap_acum, sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list), sum(r["pnl_hoy"] for r in res_list), op_finde)
@@ -710,7 +1014,7 @@ def main():
                     time.sleep(0.4)
 
     if (en_hor and estado.get("ultima_hora_resumen") != h_str) or forzar_est:
-        lin = [f"<b>{VERSION}</b>", f"<b>Estado de Sesión</b> ({f_hum})", f"💰 <b>Balance Bitácora:</b> ${cap_acum:.2f} USDT\n"]
+        lin = [f"<b>{VERSION}</b>", f"<b>Estado de Sesión</b> ({f_hum})", f"💰 <b>Balance Neto Bitácora:</b> ${cap_acum:.2f} USDT\n"]
         for r in res_list:
             s = "+" if r["pnl_hoy"] >= 0 else "-"
             lin.append(f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} | 🎯{r['dyn_mult']:.2f}x | Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.0f})")
@@ -729,8 +1033,8 @@ def main():
             s = "+" if r["pnl_hoy"] >= 0 else "-"
             lin.append(f"• <b>{r['symbol']}.P:</b> {r['w_hoy']}G - {r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.2f})")
         lin.append(f"\n<b>Balance Sesión:</b> {tw}G / {tl}P ({wr:.1f}% WR)")
-        lin.append(f"<b>PnL Consolidado Hoy:</b> {st}${abs(ptot):.2f} USD")
-        lin.append(f"<b>Capital Acumulado Bitácora:</b> ${cap_acum:.2f} USDT")
+        lin.append(f"<b>PnL Bruto Hoy:</b> {st}${abs(ptot):.2f} USD")
+        lin.append(f"<b>Capital Neto Bitácora:</b> ${cap_acum:.2f} USDT")
         lin.append("<i>Estado congelado hasta las 08:00 UTC-4.</i>")
         if enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=op_finde):
             estado["ultimo_cierre_dia"] = f_str
