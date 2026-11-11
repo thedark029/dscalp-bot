@@ -1,27 +1,23 @@
 {
-  "motor": "pine_v386_clone",
-  "ultima_hora_resumen": "2026-11-10_21",
+  "motor": "pine_v386_excel_v3",
+  "ultima_hora_resumen": "",
   "ultimo_cierre_dia": "2026-11-10",
   "ultimo_ts_evento": {
-    "BTCUSDT": 1794349200000,
+    "ETHUSDT": 1794315300000,
     "BNBUSDT": 1794335400000,
+    "XRPUSDT": 1794331800000,
+    "SOLUSDT": 1794334800000,
     "XAGUSDT": 1794322800000,
     "XAUTUSDT": 1794361200000,
-    "ZECUSDT": 1794359700000,
-    "ETHUSDT": 1794315300000,
-    "XRPUSDT": 1794331800000,
-    "SOLUSDT": 1794334800000
+    "ZECUSDT": 1794362700000
   },
   "operar_finde_activo": false,
   "last_update_id": 0,
-  "capital_acumulado": 76.0,
+  "capital_acumulado": 77.98,
   "trades_registrados": [
-    "XAGUSDT_1794226500000",
     "XAUTUSDT_1794249600000",
     "ZECUSDT_1794249900000",
-    "BTCUSDT_1794255000000",
     "XAUTUSDT_1794261000000",
-    "BTCUSDT_1794266100000",
     "BNBUSDT_1794257100000",
     "ETHUSDT_1794312300000",
     "BNBUSDT_1794312000000",
@@ -32,7 +28,7 @@
     "SOLUSDT_1794332100000",
     "BNBUSDT_1794334200000",
     "ZECUSDT_1794334200000",
-    "BTCUSDT_1794348300000",
-    "XAUTUSDT_1794320700000"
+    "XAUTUSDT_1794320700000",
+    "ZECUSDT_1794354300000"
   ]
 }
