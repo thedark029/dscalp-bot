@@ -1,6 +1,8 @@
 name: D-Scalp Bot 247
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       origen:
@@ -18,7 +20,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 4
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
@@ -53,4 +55,4 @@ jobs:
           if [ -f Bitacora_DScalp_PRO.xlsx ]; then
             git add Bitacora_DScalp_PRO.xlsx
           fi
-          git diff --staged --quiet || (git commit -m "chore: update bot state and pro excel journal [skip ci]" && git push)
+          git diff --staged --quiet || (git commit -m "chore: update bot state and pro excel journal [skip ci]" && git pull --rebase origin ${{ github.ref_name }} && git push)
