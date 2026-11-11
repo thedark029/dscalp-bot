@@ -31,7 +31,7 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar librerias necesarias
-        run: pip install -q requests pandas numpy urllib3
+        run: pip install -q requests pandas numpy urllib3 openpyxl
 
       - name: Ejecutar Bot D-Scalp V3.8.6
         env:
@@ -40,7 +40,7 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event.inputs.origen == 'auto' && 'schedule' || github.event_name }}
         run: python bot.py
 
-      - name: Persistir estado de alertas y bitacora CSV
+      - name: Persistir estado de alertas y bitacora Excel
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -50,4 +50,7 @@ jobs:
           if [ -f bitacora_dscalp.csv ]; then
             git add bitacora_dscalp.csv
           fi
-          git diff --staged --quiet || (git commit -m "chore: update bot state and journal [skip ci]" && git push)
+          if [ -f Bitacora_DScalp_PRO.xlsx ]; then
+            git add Bitacora_DScalp_PRO.xlsx
+          fi
+          git diff --staged --quiet || (git commit -m "chore: update bot state and pro excel journal [skip ci]" && git push)
