@@ -1,6 +1,6 @@
 {
   "motor": "pine_v386_excel_v3",
-  "ultima_hora_resumen": "",
+  "ultima_hora_resumen": "2026-11-11_08",
   "ultimo_cierre_dia": "2026-11-10",
   "ultimo_ts_evento": {
     "ETHUSDT": 1794315300000,
@@ -13,7 +13,7 @@
   },
   "operar_finde_activo": false,
   "last_update_id": 0,
-  "capital_acumulado": 77.98,
+  "capital_acumulado": 65.59,
   "trades_registrados": [
     "XAUTUSDT_1794249600000",
     "ZECUSDT_1794249900000",
@@ -29,6 +29,10 @@
     "BNBUSDT_1794334200000",
     "ZECUSDT_1794334200000",
     "XAUTUSDT_1794320700000",
-    "ZECUSDT_1794354300000"
+    "ZECUSDT_1794354300000",
+    "XAGUSDT_1794226500000",
+    "BTCUSDT_1794255000000",
+    "BTCUSDT_1794266100000",
+    "BTCUSDT_1794348300000"
   ]
 }
