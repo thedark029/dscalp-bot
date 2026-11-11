@@ -13,7 +13,7 @@
   },
   "operar_finde_activo": false,
   "last_update_id": 0,
-  "capital_acumulado": 65.59,
+  "capital_acumulado": 62.57,
   "trades_registrados": [
     "XAUTUSDT_1794249600000",
     "ZECUSDT_1794249900000",
@@ -33,6 +33,7 @@
     "XAGUSDT_1794226500000",
     "BTCUSDT_1794255000000",
     "BTCUSDT_1794266100000",
-    "BTCUSDT_1794348300000"
+    "BTCUSDT_1794348300000",
+    "BTCUSDT_1794252300000"
   ]
 }
