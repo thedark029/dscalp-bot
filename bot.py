@@ -33,9 +33,9 @@ NATR_MIN_SC = 1.00
 NATR_MAX_SC = 1.15
 
 # Filtros opcionales de proteccion cuantitativa (Sincronizados con Pine Script)
-USAR_TECHO_ADX = False
+USAR_TECHO_ADX = True
 ADX_MAX_MAN = 35.0
-USAR_PISO_SL = False
+USAR_PISO_SL = True
 
 USAR_EMA50 = True
 USAR_SR = True
