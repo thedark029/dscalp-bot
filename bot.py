@@ -687,7 +687,7 @@ def obtener_config_activo(symbol):
 
 
 # ==============================================================================
-# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.6
+# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.6 (CON BLOQUEO ADX > 35 Y MICRO-SL)
 # ==============================================================================
 def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     df5 = fetch_klines(symbol, "5m", 1200)
@@ -732,6 +732,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     prev_dia = None
     eventos_hoy, eventos_finde, trades_cerrados = [], [], []
     gan1, gan2 = RIESGO_USD * 0.5 * r_tp1, RIESGO_USD * 0.5 * r_tp2
+    piso_sl_pct = 0.0015 if es_metal else 0.0025
 
     for i in range(2 * PIV_LEN, len(df5)):
         c_idx = i - PIV_LEN
@@ -746,7 +747,6 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         ts = int(ts_arr[i])
         dt_loc = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
         es_hoy = (dt_loc.date() == fecha_hoy_utc4)
-        # Ventana de 4 dias para asegurar la reconciliacion de cualquier trade pasado o del mediodia
         es_reciente_bitacora = ((fecha_hoy_utc4 - dt_loc.date()).days <= 4)
 
         min_r, max_r = np.min(low[i - 12:i]), np.max(high[i - 12:i])
@@ -846,8 +846,13 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         en_op = False if fin_op else en_op
         direccion = 0 if fin_op else direccion
 
+        # Bloqueo de Micro-Stop (< 0.25% Cripto | < 0.15% Metales) y Techo de ADX (<= 35.0)
+        dyn_m = dyn_mult_arr[i]
+        dist_sl = atr[i] * dyn_m
+        no_micro_stop = (not USAR_PISO_SL) or ((dist_sl / close[i]) >= piso_sl_pct)
         adx_ok = (cfg_adx <= adx_val[i] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[i] >= cfg_adx)
-        f_tend = adx_ok and (abs(ema9[i] - ema21[i]) >= atr[i] * 0.12)
+        f_tend = adx_ok and (abs(ema9[i] - ema21[i]) >= atr[i] * 0.12) and no_micro_stop
+
         p_alc, p_baj = (ema9[i] > ema9[i - 2] and ema21[i] > ema21[i - 2]), (ema9[i] < ema9[i - 2] and ema21[i] < ema21[i - 2])
         e50_alc = (not USAR_EMA50) or (close[i] > ema50[i] and (ema21[i] >= ema50[i] or ema50[i] > ema50[i - 3]))
         e50_baj = (not USAR_EMA50) or (close[i] < ema50[i] and (ema21[i] <= ema50[i] or ema50[i] < ema50[i - 3]))
@@ -861,9 +866,6 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         no_reb_alc = (b_liq_alc > 3) and (np.isnan(sop_act) or close[i] < sop_act or low[i] < low[i - 2] or alin_baj)
         no_rec_baj = (b_liq_baj > 3) and (np.isnan(res_act) or close[i] > res_act or high[i] > high[i - 2] or alin_alc)
 
-        dyn_m = dyn_mult_arr[i]
-        piso_sl_pct = 0.0015 if es_metal else 0.0025
-        dist_sl = max(atr[i] * dyn_m, close[i] * piso_sl_pct) if USAR_PISO_SL else (atr[i] * dyn_m)
         fac_muro = (MARGEN_MURO * 0.55) if (alin_alc or alin_baj) else MARGEN_MURO
         req_esp = (atr[i] * 1.5) * r_tp1 * fac_muro
         cam_l = not (USAR_SR and (not np.isnan(res_act)) and close[i] < res_act and (res_act - close[i]) < req_esp)
@@ -908,8 +910,11 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     u = len(df5) - 1
     dt_u = datetime.fromtimestamp(int(ts_arr[u]) / 1000.0, tz=TZ_UTC4)
     cme_cerr_u = es_metal and BLOQUEO_CME_METALES and (dt_u.weekday() in (5, 6) or (dt_u.weekday() == 4 and (dt_u.hour > 16 or (dt_u.hour == 16 and dt_u.minute >= 30))))
+    dist_sl_u = atr[u] * dyn_mult_arr[u]
+    micro_stop_u = USAR_PISO_SL and ((dist_sl_u / close[u]) < piso_sl_pct)
+    adx_climax_u = USAR_TECHO_ADX and (adx_val[u] > ADX_MAX_MAN)
     adx_ok_u = (cfg_adx <= adx_val[u] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[u] >= cfg_adx)
-    f_ult = adx_ok_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12)
+    f_ult = adx_ok_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12) and (not micro_stop_u)
     t15_u, t30_u = bool(t15_arr[u]), bool(t30_arr[u])
     al_alc_u = t15_u and t30_u and (close[u] > vwap_val[u]) and (ema21[u] > ema50[u])
     al_baj_u = (not t15_u) and (not t30_u) and (close[u] < vwap_val[u]) and (ema21[u] < ema50[u])
@@ -919,7 +924,6 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     mtf_b_u = (not t15_u) and ((not t30_u) or (close[u] < vwap_val[u] and b_liq_baj <= 6)) and ((not USAR_VWAP) or close[u] < vwap_val[u])
     bloq_m = ((-1 if mtf_b_u else 1) == 1 and m_res_u) or ((-1 if mtf_b_u else 1) == -1 and m_sop_u)
 
-    # Prioridad visual sincronizada con Pine Script: operacion abierta primero
     if en_op:
         est_c = (f"🛡️ LONG BE ({fmt_p(p_ent)})" if tp1_hit else f"🟢 LONG ({fmt_p(p_ent)})") if direccion == 1 else (f"🛡️ SHORT BE ({fmt_p(p_ent)})" if tp1_hit else f"🔴 SHORT ({fmt_p(p_ent)})")
     elif cme_cerr_u:
@@ -928,6 +932,10 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         est_c = f"⛔ PAUSA ({racha_l}/{MAX_DERROTAS})"
     elif bloq_m:
         est_c = "🧱 MURO S/R"
+    elif micro_stop_u:
+        est_c = f"⚠️ MICRO-SL ({(dist_sl_u / close[u]) * 100:.2f}%)"
+    elif adx_climax_u:
+        est_c = f"🔥 CLÍMAX (ADX {int(round(adx_val[u]))}>{int(ADX_MAX_MAN)})"
     elif not f_ult:
         est_c = f"⏸️ RANGO (ADX {int(round(adx_val[u]))}/{cfg_adx})"
     else:
