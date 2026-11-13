@@ -11,30 +11,31 @@ warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-# 1. PARAMETROS GLOBALES V3.8.6 MULTI-ASSET (SINCRONIZADO + AUTO-RECONCILIACION)
+# 1. PARAMETROS GLOBALES V3.8.7 (1:1.5 / 1:3.0 + ADX 25-34 + CIRCUIT BREAKER)
 # ==============================================================================
-VERSION = "D-SCALP V3.8.6"
+VERSION = "D-SCALP V3.8.7"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "XAGUSDT", "XAUTUSDT", "ZECUSDT"]
 
 CAPITAL_INICIAL = 100.0
 RIESGO_PORC = 2.0
 RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
-MAX_DERROTAS = 3
-TAKER_FEE = 0.0006  # 0.06% Taker Fee por orden (0.12% redondo apertura + cierre)
+MAX_DERROTAS = 2              # Max 2 SL seguidos por moneda en el dia
+MAX_SL_GLOBAL_DIA = 3         # Circuit Breaker Global: pausa toda la cuenta tras 3 SL en el dia
+TAKER_FEE = 0.0006            # 0.06% Taker Fee por orden (0.12% redondo apertura + cierre)
 
 AUTO_DETECT = True
 MULTIPLICADOR_ATR_MAN = 1.5
-ADX_MIN_MAN = 19
-RATIO_TP1_MAN = 2.0
-RATIO_TP2_MAN = 4.0
+ADX_MIN_MAN = 25.0            # Piso ADX 25.0 (elimina entradas debiles < 25)
+RATIO_TP1_MAN = 1.5
+RATIO_TP2_MAN = 3.0
 USAR_NATR = True
 NATR_SMA_LEN = 50
 NATR_MIN_SC = 1.00
 NATR_MAX_SC = 1.15
 
-# Filtros opcionales de proteccion cuantitativa (Sincronizados con Pine Script)
+# Filtros de precision cuantitativa ACTIVADOS (Sincronizados con Pine Script)
 USAR_TECHO_ADX = True
-ADX_MAX_MAN = 35.0
+ADX_MAX_MAN = 34.0            # Techo ADX 34.0 (conserva impulsos NY Open 32-33.6, bloquea > 34)
 USAR_PISO_SL = True
 
 USAR_EMA50 = True
@@ -50,7 +51,7 @@ MAX_DIST_ATR = 1.25
 VELAS_COOLDOWN = 8
 PERMITIR_SHORTS = True
 HORA_INICIO = 8
-HORA_FIN = 22
+HORA_FIN = 20
 
 STATE_FILE = "estado_bot.json"
 BITACORA_FILE = "bitacora_dscalp.csv"
@@ -60,9 +61,8 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.6"})
+SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.7"})
 
-# 23 Columnas Auditadas
 ENCABEZADOS_BITACORA = [
     "ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Duracion_Min", "Sesion",
     "Ticker", "Direccion", "Entrada", "Salida_Prom_Ponderada", "SL_Inicial",
@@ -105,11 +105,6 @@ def contar_trades_bitacora():
 
 
 def sincronizar_bitacora_completa(trades_detectados, estado):
-    """
-    Une las operaciones historicas del CSV con cualquier operacion cerrada en los
-    ultimos 4 dias que haya faltado (ej. corte de red o corrida de mediodia),
-    las ordena cronologicamente por Fecha_Salida y recalcula ID_Trade y Balance_USD.
-    """
     asegurar_archivo_bitacora()
     try:
         df_exist = pd.read_csv(BITACORA_FILE)
@@ -130,7 +125,6 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
         f_sal = dt_sal.strftime("%d/%m %H:%M")
         clave_unica = (str(tr["ticker"]).strip(), f_ent)
 
-        # Si la operacion ya existe fisicamente en el CSV, no se duplica
         if clave_unica in claves_csv:
             trades_reg.add(tr["uid"])
             continue
@@ -192,13 +186,11 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
         estado["trades_registrados"] = list(trades_reg)
         return CAPITAL_INICIAL, False
 
-    # Ordenamiento cronologico exacto por Fecha_Salida y Fecha_Entrada
     anio_actual = datetime.now(TZ_UTC4).year
     df_total["_dt_sal"] = pd.to_datetime(df_total["Fecha_Salida"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
     df_total["_dt_ent"] = pd.to_datetime(df_total["Fecha_Entrada"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
     df_total = df_total.sort_values(["_dt_sal", "_dt_ent", "Ticker"]).drop(columns=["_dt_sal", "_dt_ent"]).reset_index(drop=True)
 
-    # Recalculo contable en cascada desde CAPITAL_INICIAL
     bal = CAPITAL_INICIAL
     nuevos_ids, nuevos_balances = [], []
     for idx, row in df_total.iterrows():
@@ -216,7 +208,6 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
 
 
 def generar_excel_profesional():
-    """Compila Bitacora_DScalp_PRO.xlsx con KPIs (Filas 1-4), Freeze Panes y Semaforo."""
     asegurar_archivo_bitacora()
     df = pd.read_csv(BITACORA_FILE)
 
@@ -277,18 +268,18 @@ def generar_excel_profesional():
                 max_dd = dd
 
         adx_col = df["ADX_Entr"].astype(float)
-        df_adx_20_32 = df[(adx_col >= 20.0) & (adx_col <= 32.0)]
-        df_adx_gt_35 = df[adx_col > 35.0]
-        wr_adx_20_32 = (len(df_adx_20_32[df_adx_20_32["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_20_32) * 100.0) if len(df_adx_20_32) > 0 else 0.0
-        wr_adx_gt_35 = (len(df_adx_gt_35[df_adx_gt_35["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_gt_35) * 100.0) if len(df_adx_gt_35) > 0 else 0.0
-        n_20_32, n_gt_35 = len(df_adx_20_32), len(df_adx_gt_35)
+        df_adx_opt = df[(adx_col >= 25.0) & (adx_col <= 34.0)]
+        df_adx_out = df[(adx_col < 25.0) | (adx_col > 34.0)]
+        wr_adx_opt = (len(df_adx_opt[df_adx_opt["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_opt) * 100.0) if len(df_adx_opt) > 0 else 0.0
+        wr_adx_out = (len(df_adx_out[df_adx_out["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_out) * 100.0) if len(df_adx_out) > 0 else 0.0
+        n_opt, n_out = len(df_adx_opt), len(df_adx_out)
     else:
-        wr_real = exp_r = pnl_bruto_tot = com_tot = pnl_neto_tot = pf_neto = max_dd = wr_adx_20_32 = wr_adx_gt_35 = 0.0
+        wr_real = exp_r = pnl_bruto_tot = com_tot = pnl_neto_tot = pf_neto = max_dd = wr_adx_opt = wr_adx_out = 0.0
         bal_actual = CAPITAL_INICIAL
-        n_20_32 = n_gt_35 = 0
+        n_opt = n_out = 0
 
     ws.merge_cells("A1:W1")
-    ws["A1"] = f"⚡ {VERSION} — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)"
+    ws["A1"] = f"⚡ {VERSION} (1:1.5 / 1:3.0) — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)"
     ws["A1"].font = font_title
     ws["A1"].fill = fill_header_kpi
     ws["A1"].alignment = center
@@ -308,9 +299,9 @@ def generar_excel_profesional():
         ("M3:O3", "Max Drawdown ($):", "P3:W3", f"-${max_dd:.2f} USD")
     ]
     kpis_f4 = [
-        ("A4:D4", "Win Rate ADX 20–32 (Zona Óptima):", "E4:H4", f"{wr_adx_20_32:.1f}% WR ({n_20_32} ops)"),
-        ("I4:L4", "Win Rate ADX > 35 (Agotamiento):", "M4:P4", f"{wr_adx_gt_35:.1f}% WR ({n_gt_35} ops)"),
-        ("Q4:W4", "Alerta Micro-Stop: < 0.25% Cripto | < 0.15% Metales", None, None)
+        ("A4:D4", "Win Rate ADX 25–34 (Zona Óptima):", "E4:H4", f"{wr_adx_opt:.1f}% WR ({n_opt} ops)"),
+        ("I4:L4", "Win Rate Fuera Rango (<25 o >34):", "M4:P4", f"{wr_adx_out:.1f}% WR ({n_out} ops)"),
+        ("Q4:W4", f"Circuit Breaker: Max {MAX_SL_GLOBAL_DIA} SL/día Global | Micro-SL <0.25%", None, None)
     ]
 
     for row_idx, kpi_list in [(2, kpis_f2), (3, kpis_f3), (4, kpis_f4)]:
@@ -345,7 +336,7 @@ def generar_excel_profesional():
         ws.row_dimensions[excel_r].height = 19
         res_str = str(row["Resultado"])
         tk_str = str(row["Ticker"])
-        es_metal_row = ("XAU" in tk_str) or ("XAG" in tk_str)
+        es_oro_row = ("XAU" in tk_str)
 
         for c_idx, col_name in enumerate(ENCABEZADOS_BITACORA, start=1):
             val = row[col_name]
@@ -365,7 +356,7 @@ def generar_excel_profesional():
             elif col_name == "Distancia_SL_%":
                 cell.number_format = "0.00%"
                 cell.alignment = right
-                umbral_micro = 0.0015 if es_metal_row else 0.0025
+                umbral_micro = 0.0020 if es_oro_row else 0.0025
                 if float(val) < umbral_micro:
                     cell.fill = fill_warn
                     cell.font = font_warn
@@ -384,7 +375,7 @@ def generar_excel_profesional():
             elif col_name == "ADX_Entr":
                 cell.number_format = "0.0"
                 cell.alignment = right
-                if float(val) > 35.0:
+                if float(val) < 25.0 or float(val) > 34.0:
                     cell.fill = fill_warn
                     cell.font = font_warn
             elif col_name == "R_Multiple":
@@ -474,7 +465,7 @@ def enviar_documento_bitacora(capital_actual, w_hoy, l_hoy, pnl_hoy, operar_find
         f"• <b>Trades registrados:</b> {total_regs}\n"
         f"• <b>Balance Neto Real:</b> ${capital_actual:.2f} USDT\n"
         f"• <b>Sesión Hoy:</b> {w_hoy}G - {l_hoy}P ({s_hoy}${abs(pnl_hoy):.2f} USDT)\n"
-        f"<i>Con Reconciliación Cronológica, KPIs fijos (Filas 1-4), Salida Ponderada y Comisiones 0.12%.</i>"
+        f"<i>TP1 1:1.5 / TP2 1:3.0 | Banda ADX 25-34 | Circuit Breaker {MAX_SL_GLOBAL_DIA} SL/día.</i>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
@@ -503,7 +494,7 @@ def cargar_estado():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                d.setdefault("motor", "pine_v386_excel_v4")
+                d.setdefault("motor", "pine_v387_cb_global")
                 d.setdefault("ultima_hora_resumen", "")
                 d.setdefault("ultimo_cierre_dia", "")
                 d.setdefault("ultimo_ts_evento", {})
@@ -515,7 +506,7 @@ def cargar_estado():
         except Exception:
             pass
     return {
-        "motor": "pine_v386_excel_v4", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
+        "motor": "pine_v387_cb_global", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
         "ultimo_ts_evento": {}, "operar_finde_activo": OPERAR_FINDE_DEFAULT,
         "last_update_id": 0, "capital_acumulado": CAPITAL_INICIAL, "trades_registrados": []
     }
@@ -523,7 +514,7 @@ def cargar_estado():
 
 def guardar_estado(estado):
     try:
-        estado["motor"] = "pine_v386_excel_v4"
+        estado["motor"] = "pine_v387_cb_global"
         if len(estado.get("trades_registrados", [])) > 1000:
             estado["trades_registrados"] = estado["trades_registrados"][-1000:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -591,10 +582,10 @@ def fetch_klines(symbol, granularity="5m", total_candles=1200):
                     end_time = int(dfb["ts"].min()) - 1
                     needed = 0 if len(dfb) < batch else needed - len(dfb)
                     ok = True
-                    time.sleep(0.12)  # Pausa suave entre bloques para evitar bloqueo de Bitget
+                    time.sleep(0.12)
                     break
                 else:
-                    time.sleep(0.8 * (intento + 1))  # Espera progresiva ante Rate-Limit
+                    time.sleep(0.8 * (intento + 1))
             except Exception:
                 time.sleep(1.0 * (intento + 1))
         if not ok:
@@ -662,7 +653,7 @@ def pine_atr_dmi(high, low, close, length=14):
     m_di = np.divide(100.0 * rma_m, atr, out=np.zeros_like(atr), where=(atr != 0) & (~np.isnan(atr)))
     s_di = p_di + m_di
     dx = np.where(np.isnan(rma_p), np.nan, np.divide(100.0 * np.abs(p_di - m_di), np.where(s_di == 0, 1.0, s_di)))
-    return atr, pine_rma(dx, length)
+    return atr, pine_rma(dx, length), p_di, m_di
 
 
 def obtener_config_activo(symbol):
@@ -678,23 +669,22 @@ def obtener_config_activo(symbol):
     es_metal = es_xau or es_xag
 
     cfg_atr = 1.5 if (es_btc or es_eth or es_bnb or es_xau) else (1.55 if (es_xrp or es_xag) else (1.65 if es_sol else (1.8 if es_zec else MULTIPLICADOR_ATR_MAN)))
-    cfg_adx = 19 if (es_btc or es_eth or es_bnb or es_xau) else (20 if (es_xrp or es_xag or es_sol) else (21 if es_zec else ADX_MIN_MAN))
+    cfg_adx = 25.0 if (es_btc or es_eth or es_bnb or es_xau or es_xrp or es_xag or es_sol or es_zec) else ADX_MIN_MAN
     alguno = es_btc or es_eth or es_bnb or es_xrp or es_xau or es_xag or es_sol or es_zec
-    r_tp1 = 2.0 if (AUTO_DETECT and alguno) else RATIO_TP1_MAN
-    r_tp2 = 3.5 if es_zec else (4.0 if (AUTO_DETECT and alguno) else RATIO_TP2_MAN)
+    r_tp1 = 1.5 if (AUTO_DETECT and alguno) else RATIO_TP1_MAN
+    r_tp2 = 3.0 if (AUTO_DETECT and alguno) else RATIO_TP2_MAN
     es_est = es_btc or es_eth or es_bnb or es_xau or es_xag or es_xrp
     return cfg_atr, cfg_adx, r_tp1, r_tp2, (NATR_MIN_SC if es_est else 0.95), (NATR_MAX_SC if es_est else 1.25), es_metal
 
 
 # ==============================================================================
-# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.6 (CON BLOQUEO ADX > 35 Y MICRO-SL)
+# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.7 (ADX 25-34 + 1:1.5 / 1:3.0)
 # ==============================================================================
-def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
+def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_global_hoy=False):
     df5 = fetch_klines(symbol, "5m", 1200)
     df15 = fetch_klines(symbol, "15m", 450)
     df30 = fetch_klines(symbol, "30m", 400)
 
-    # Exige al menos 600 velas en 5m (~50 horas) para impedir truncamiento matutino
     if df5.empty or len(df5) < 600 or df15.empty or df30.empty:
         return None
     df5 = df5.iloc[:-1].copy().reset_index(drop=True)
@@ -712,14 +702,13 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     cfg_atr, cfg_adx, r_tp1, r_tp2, esc_min, esc_max, es_metal = obtener_config_activo(symbol)
     ema9, ema21, ema50 = pine_ema(close, 9), pine_ema(close, 21), pine_ema(close, 50)
     rsi = pine_rsi(close, 14)
-    atr, adx_val = pine_atr_dmi(high, low, close, 14)
+    atr, adx_val, p_di, m_di = pine_atr_dmi(high, low, close, 14)
 
     natr = np.divide(atr, close, out=np.zeros_like(atr), where=close != 0) * 100.0
     natr_sma = pine_sma(natr, NATR_SMA_LEN)
     vol_r = np.where((~np.isnan(natr_sma)) & (natr_sma > 0), natr / natr_sma, 1.0)
     dyn_mult_arr = np.where(USAR_NATR, np.maximum(cfg_atr * esc_min, np.minimum(cfg_atr * esc_max, cfg_atr * vol_r)), cfg_atr)
 
-    # Anclaje VWAP a las 00:00 UTC (Sincronizado con Pine Script)
     fechas_utc = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.date
     df5["tp_vol"] = ((high + low + close) / 3.0) * vol
     vwap_val = (df5.groupby(fechas_utc)["tp_vol"].cumsum() / df5.groupby(fechas_utc)["vol"].cumsum().replace(0, np.nan)).values
@@ -732,7 +721,8 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     prev_dia = None
     eventos_hoy, eventos_finde, trades_cerrados = [], [], []
     gan1, gan2 = RIESGO_USD * 0.5 * r_tp1, RIESGO_USD * 0.5 * r_tp2
-    piso_sl_pct = 0.0015 if es_metal else 0.0025
+    es_oro = ("XAU" in symbol.upper()) or ("GOLD" in symbol.upper())
+    piso_sl_pct = 0.0020 if es_oro else 0.0025
 
     for i in range(2 * PIV_LEN, len(df5)):
         c_idx = i - PIV_LEN
@@ -846,16 +836,16 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         en_op = False if fin_op else en_op
         direccion = 0 if fin_op else direccion
 
-        # Bloqueo de Micro-Stop (< 0.25% Cripto | < 0.15% Metales) y Techo de ADX (<= 35.0)
         dyn_m = dyn_mult_arr[i]
         dist_sl = atr[i] * dyn_m
         no_micro_stop = (not USAR_PISO_SL) or ((dist_sl / close[i]) >= piso_sl_pct)
         adx_ok = (cfg_adx <= adx_val[i] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[i] >= cfg_adx)
-        f_tend = adx_ok and (abs(ema9[i] - ema21[i]) >= atr[i] * 0.12) and no_micro_stop
+        adx_subiendo = (adx_val[i] >= adx_val[i - 1]) or (adx_val[i] >= 28.0)
+        f_tend = adx_ok and adx_subiendo and (abs(ema9[i] - ema21[i]) >= atr[i] * 0.12) and no_micro_stop
 
         p_alc, p_baj = (ema9[i] > ema9[i - 2] and ema21[i] > ema21[i - 2]), (ema9[i] < ema9[i - 2] and ema21[i] < ema21[i - 2])
-        e50_alc = (not USAR_EMA50) or (close[i] > ema50[i] and (ema21[i] >= ema50[i] or ema50[i] > ema50[i - 3]))
-        e50_baj = (not USAR_EMA50) or (close[i] < ema50[i] and (ema21[i] <= ema50[i] or ema50[i] < ema50[i - 3]))
+        e50_alc = ((not USAR_EMA50) or (close[i] > ema50[i] and ema21[i] > ema50[i])) and (p_di[i] > m_di[i])
+        e50_baj = ((not USAR_EMA50) or (close[i] < ema50[i] and ema21[i] < ema50[i])) and (m_di[i] > p_di[i])
 
         t15, t30 = bool(t15_arr[i]), bool(t30_arr[i])
         mtf_alc = t15 and (t30 or (close[i] > vwap_val[i] and imp_alc)) and ((not USAR_VWAP) or close[i] > vwap_val[i])
@@ -871,7 +861,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         cam_l = not (USAR_SR and (not np.isnan(res_act)) and close[i] < res_act and (res_act - close[i]) < req_esp)
         cam_s = not (USAR_SR and (not np.isnan(sop_act)) and close[i] > sop_act and (close[i] - sop_act) < req_esp)
 
-        pausado = racha_l >= MAX_DERROTAS
+        pausado = (racha_l >= MAX_DERROTAS) or (es_hoy and bloqueo_global_hoy)
         no_ext = abs(close[i] - ema21[i]) <= (atr[i] * MAX_DIST_ATR)
         rng = high[i] - low[i]
         vf_l = (close[i] > open_p[i]) and ((not EXIGIR_VELA_FIRME) or rng == 0 or (high[i] - close[i]) <= rng * 0.42)
@@ -900,7 +890,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
             ev_e = {
                 "ts": ts, "tipo": "ENTRY_LONG" if s_long else "ENTRY_SHORT", "par": symbol,
                 "entrada": p_ent, "sl": sl_act, "tp1": tp1_act, "tp2": tp2_act,
-                "lotaje": pos_sz, "dyn_mult": dyn_m, "ratio_tp2": r_tp2
+                "lotaje": pos_sz, "dyn_mult": dyn_m, "ratio_tp1": r_tp1, "ratio_tp2": r_tp2
             }
             if es_hoy:
                 eventos_hoy.append(ev_e)
@@ -914,7 +904,8 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     micro_stop_u = USAR_PISO_SL and ((dist_sl_u / close[u]) < piso_sl_pct)
     adx_climax_u = USAR_TECHO_ADX and (adx_val[u] > ADX_MAX_MAN)
     adx_ok_u = (cfg_adx <= adx_val[u] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[u] >= cfg_adx)
-    f_ult = adx_ok_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12) and (not micro_stop_u)
+    adx_sub_u = (adx_val[u] >= adx_val[u - 1]) or (adx_val[u] >= 28.0)
+    f_ult = adx_ok_u and adx_sub_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12) and (not micro_stop_u)
     t15_u, t30_u = bool(t15_arr[u]), bool(t30_arr[u])
     al_alc_u = t15_u and t30_u and (close[u] > vwap_val[u]) and (ema21[u] > ema50[u])
     al_baj_u = (not t15_u) and (not t30_u) and (close[u] < vwap_val[u]) and (ema21[u] < ema50[u])
@@ -928,8 +919,10 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         est_c = (f"🛡️ LONG BE ({fmt_p(p_ent)})" if tp1_hit else f"🟢 LONG ({fmt_p(p_ent)})") if direccion == 1 else (f"🛡️ SHORT BE ({fmt_p(p_ent)})" if tp1_hit else f"🔴 SHORT ({fmt_p(p_ent)})")
     elif cme_cerr_u:
         est_c = "🏦 CME CERRADO"
+    elif bloqueo_global_hoy:
+        est_c = f"🛑 FRENO GLOBAL ({MAX_SL_GLOBAL_DIA} SL/día)"
     elif racha_l >= MAX_DERROTAS:
-        est_c = f"⛔ PAUSA ({racha_l}/{MAX_DERROTAS})"
+        est_c = f"⛔ PAUSA PAR ({racha_l}/{MAX_DERROTAS})"
     elif bloq_m:
         est_c = "🧱 MURO S/R"
     elif micro_stop_u:
@@ -937,7 +930,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     elif adx_climax_u:
         est_c = f"🔥 CLÍMAX (ADX {int(round(adx_val[u]))}>{int(ADX_MAX_MAN)})"
     elif not f_ult:
-        est_c = f"⏸️ RANGO (ADX {int(round(adx_val[u]))}/{cfg_adx})"
+        est_c = f"⏸️ RANGO (ADX {int(round(adx_val[u]))}/{int(cfg_adx)})"
     else:
         est_c = "🔍 ACTIVO"
 
@@ -950,14 +943,22 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
 
 
 def obtener_resultados_mercado(f_hoy, op_finde):
-    """Ejecuta en paralelo con 4 hilos y reintenta secuencialmente si algun par sufrio Rate-Limit."""
     with ThreadPoolExecutor(max_workers=4) as ex:
-        res_map = dict(zip(SYMBOLS, ex.map(lambda s: analizar_moneda(s, f_hoy, op_finde), SYMBOLS)))
+        res_map = dict(zip(SYMBOLS, ex.map(lambda s: analizar_moneda(s, f_hoy, op_finde, False), SYMBOLS)))
     for sym in SYMBOLS:
         if res_map.get(sym) is None:
             time.sleep(1.5)
-            res_map[sym] = analizar_moneda(sym, f_hoy, op_finde)
-    return [res_map[s] for s in SYMBOLS if res_map.get(s) is not None]
+            res_map[sym] = analizar_moneda(sym, f_hoy, op_finde, False)
+
+    res_list = [res_map[s] for s in SYMBOLS if res_map.get(s) is not None]
+
+    # Verificar Circuit Breaker Global Diario (si la cuenta suma >= MAX_SL_GLOBAL_DIA derrotas hoy)
+    total_sl_hoy = sum(r["l_hoy"] for r in res_list)
+    if total_sl_hoy >= MAX_SL_GLOBAL_DIA:
+        for r in res_list:
+            if not r["en_op"]:
+                r["estado"] = f"🛑 FRENO GLOBAL ({total_sl_hoy}/{MAX_SL_GLOBAL_DIA} SL)"
+    return res_list
 
 
 def formatear_alerta_evento(ev):
@@ -967,7 +968,8 @@ def formatear_alerta_evento(ev):
         return (
             f"<b>{VERSION}</b>\n<b>Par:</b> {par} | 🎯 <b>NATR:</b> {ev.get('dyn_mult', 1.5):.2f}x\n"
             f"<b>Tipo:</b> {d}\n<b>Entrada:</b> {fmt_p(ev['entrada'])}\n<b>SL:</b> {fmt_p(ev['sl'])}\n"
-            f"<b>TP1 (1:2):</b> {fmt_p(ev['tp1'])}\n<b>TP2 (1:{ev.get('ratio_tp2', 4.0):g}):</b> {fmt_p(ev['tp2'])}\n"
+            f"<b>TP1 (1:{ev.get('ratio_tp1', 1.5):g}):</b> {fmt_p(ev['tp1'])}\n"
+            f"<b>TP2 (1:{ev.get('ratio_tp2', 3.0):g}):</b> {fmt_p(ev['tp2'])}\n"
             f"<b>Lotaje (${RIESGO_USD:.0f}):</b> {ev['lotaje']:.3f}\n<b>Fecha/Hora:</b> {fh}"
         )
     etiq = {"SL": "🔴 STOP LOSS (SL)", "TP1": "🎯 TAKE PROFIT 1 (SL a BE)", "TP2": "🏆 TAKE PROFIT 2 (FINAL)", "BE": "🛡️ BREAK-EVEN (SL)"}
@@ -1005,7 +1007,7 @@ def enviar_reporte_finde(fecha_hoy_utc4, operar_finde_activo):
 
 
 # ==============================================================================
-# 6. BUCLE PRINCIPAL DE EJECUCION (CON VIGILANCIA DE CIERRES POST-22:00)
+# 6. BUCLE PRINCIPAL DE EJECUCION
 # ==============================================================================
 def main():
     ahora = datetime.now(TZ_UTC4)
@@ -1051,7 +1053,6 @@ def main():
             guardar_estado(estado)
         return
 
-    # 1. Reconciliar todas las operaciones cerradas en los ultimos 4 dias (incluye hoy y ayer)
     cerrados = []
     for r in res_list:
         cerrados.extend(r.get("trades_cerrados", []))
@@ -1065,36 +1066,41 @@ def main():
     if enviar_csv:
         enviar_documento_bitacora(cap_acum, sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list), sum(r["pnl_hoy"] for r in res_list), op_finde)
 
-    # 2. Enviar alertas individuales de entradas y salidas (incluyendo cierres tardios post-22:00)
+    total_sl_hoy = sum(r["l_hoy"] for r in res_list)
+    bloqueo_global_activo = (total_sl_hoy >= MAX_SL_GLOBAL_DIA)
+
     u_map = estado.setdefault("ultimo_ts_evento", {})
     for r in res_list:
         sym = r["symbol"]
         u_ts = int(u_map.get(sym, 0))
         for ev in r["eventos"]:
             if ev["ts"] > u_ts:
+                # Si ya salto el Circuit Breaker global hoy, no dispara nuevas entradas hoy
+                if bloqueo_global_activo and ev["tipo"] in ("ENTRY_LONG", "ENTRY_SHORT") and datetime.fromtimestamp(ev["ts"] / 1000.0, tz=TZ_UTC4).date() == f_hoy:
+                    u_map[sym] = ev["ts"]
+                    cambios = True
+                    continue
                 if enviar_telegram(formatear_alerta_evento(ev)):
                     u_map[sym] = ev["ts"]
                     cambios = True
                     time.sleep(0.4)
 
-    # 3. Resumen horario (Solo entre 08:00 y 22:00 UTC-4 o si se pide manualmente)
     if (en_hor and estado.get("ultima_hora_resumen") != h_str) or forzar_est:
         lin = [f"<b>{VERSION}</b>", f"<b>Estado de Sesión</b> ({f_hum})", f"💰 <b>Balance Neto Bitácora:</b> ${cap_acum:.2f} USDT\n"]
         for r in res_list:
             s = "+" if r["pnl_hoy"] >= 0 else "-"
-            lin.append(f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} | 🎯{r['dyn_mult']:.2f}x | Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.0f})")
+            lin.append(f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} | 🎯{r['dyn_mult']:.2f}x | Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.1f})")
         if enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=op_finde):
             if en_hor:
                 estado["ultima_hora_resumen"] = h_str
             cambios = True
 
-    # 4. Cierre Diario a las 22:00 UTC-4
     if es_cierre and estado.get("ultimo_cierre_dia") != f_str:
         tw, tl = sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list)
         wr = (tw / (tw + tl) * 100.0) if (tw + tl) > 0 else 0.0
         ptot = sum(r["pnl_hoy"] for r in res_list)
         st = "+" if ptot >= 0 else "-"
-        lin = [f"<b>{VERSION}</b>", f"<b>Cierre Diario</b> ({ahora.strftime('%d/%m/%Y')} - 22:00 UTC-4)\n"]
+        lin = [f"<b>{VERSION}</b>", f"<b>Cierre Diario</b> ({ahora.strftime('%d/%m/%Y')} - {HORA_FIN:02d}:00 UTC-4)\n"]
         for r in res_list:
             s = "+" if r["pnl_hoy"] >= 0 else "-"
             lin.append(f"• <b>{r['symbol']}.P:</b> {r['w_hoy']}G - {r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.2f})")
