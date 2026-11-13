@@ -11,32 +11,34 @@ warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-# 1. PARAMETROS GLOBALES V3.8.7 (1:1.5 / 1:3.0 + ADX 25-34 + CIRCUIT BREAKER)
+# 1. PARAMETROS GLOBALES V3.8.8 (1:1.5 / 1:3.0 + COOLDOWN BE + MTF ESTRICTO)
 # ==============================================================================
-VERSION = "D-SCALP V3.8.7"
+VERSION = "D-SCALP V3.8.8"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "XAGUSDT", "XAUTUSDT", "ZECUSDT"]
 
 CAPITAL_INICIAL = 100.0
 RIESGO_PORC = 2.0
 RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
 MAX_DERROTAS = 2              # Max 2 SL seguidos por moneda en el dia
-MAX_SL_GLOBAL_DIA = 3         # Circuit Breaker Global: pausa toda la cuenta tras 3 SL en el dia
+MAX_SL_GLOBAL_DIA = 3         # Circuit Breaker Global: corta nuevas entradas tras 3 SL diarios
 TAKER_FEE = 0.0006            # 0.06% Taker Fee por orden (0.12% redondo apertura + cierre)
 
 AUTO_DETECT = True
 MULTIPLICADOR_ATR_MAN = 1.5
-ADX_MIN_MAN = 25.0            # Piso ADX 25.0 (elimina entradas debiles < 25)
-RATIO_TP1_MAN = 1.5
-RATIO_TP2_MAN = 3.0
+ADX_MIN_MAN = 25.0            # Piso ADX 25.0 (elimina entradas sin impulso < 25)
+RATIO_TP1_MAN = 1.5           # TP1 a 1.5R (asegura parcial y mueve SL a BE 25% antes)
+RATIO_TP2_MAN = 3.0           # TP2 a 3.0R (objetivo realista intradia en 5m)
 USAR_NATR = True
 NATR_SMA_LEN = 50
 NATR_MIN_SC = 1.00
 NATR_MAX_SC = 1.15
 
-# Filtros de precision cuantitativa ACTIVADOS (Sincronizados con Pine Script)
+# Filtros de precision cuantitativa ACTIVADOS (Sincronizados 100% con Pine Script V3.8.8)
 USAR_TECHO_ADX = True
-ADX_MAX_MAN = 34.0            # Techo ADX 34.0 (conserva impulsos NY Open 32-33.6, bloquea > 34)
+ADX_MAX_MAN = 34.0            # Techo ADX 34.0 (captura aperturas NY 25-34, bloquea climax > 34)
 USAR_PISO_SL = True
+EXIGIR_MTF_ESTRICTO = True    # Exige 15m y 30m alineados (evita compras/ventas contra 30m)
+COOLDOWN_TRAS_BE = True       # Activa enfriamiento de 8 velas tambien tras cierre en Break-Even
 
 USAR_EMA50 = True
 USAR_SR = True
@@ -61,7 +63,7 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 TZ_UTC4 = timezone(timedelta(hours=-4))
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.7"})
+SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.8"})
 
 ENCABEZADOS_BITACORA = [
     "ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Duracion_Min", "Sesion",
@@ -104,8 +106,39 @@ def contar_trades_bitacora():
         return 0
 
 
+def filtrar_por_circuit_breaker_diario(trades_detectados):
+    """
+    Ordena cronologicamente las operaciones de cada dia y descarta aquellas cuya
+    entrada haya ocurrido DESPUES de que la cuenta ya hubiera acumulado MAX_SL_GLOBAL_DIA (3) SL en ese mismo dia.
+    """
+    if not trades_detectados:
+        return []
+    ordenados = sorted(trades_detectados, key=lambda x: (x["ts_entrada"], x["ts_salida"]))
+    sl_corte_por_dia = {}
+
+    # Identificar a que hora exacta (ts_salida) se alcanzo el 3er SL de cada dia
+    sl_por_dia = {}
+    for tr in sorted(trades_detectados, key=lambda x: x["ts_salida"]):
+        if tr["resultado"] == "SL":
+            dia_sal = datetime.fromtimestamp(int(tr["ts_salida"]) / 1000.0, tz=TZ_UTC4).date()
+            sl_por_dia.setdefault(dia_sal, []).append(int(tr["ts_salida"]))
+            if len(sl_por_dia[dia_sal]) == MAX_SL_GLOBAL_DIA:
+                sl_corte_por_dia[dia_sal] = int(tr["ts_salida"])
+
+    filtrados = []
+    for tr in ordenados:
+        dia_ent = datetime.fromtimestamp(int(tr["ts_entrada"]) / 1000.0, tz=TZ_UTC4).date()
+        ts_corte = sl_corte_por_dia.get(dia_ent)
+        if ts_corte is not None and int(tr["ts_entrada"]) > ts_corte:
+            continue
+        filtrados.append(tr)
+    return filtrados
+
+
 def sincronizar_bitacora_completa(trades_detectados, estado):
     asegurar_archivo_bitacora()
+    trades_validos = filtrar_por_circuit_breaker_diario(trades_detectados)
+
     try:
         df_exist = pd.read_csv(BITACORA_FILE)
     except Exception:
@@ -118,7 +151,7 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
             claves_csv.add((str(r["Ticker"]).strip(), str(r["Fecha_Entrada"]).strip()))
 
     filas_nuevas = []
-    for tr in trades_detectados:
+    for tr in trades_validos:
         dt_ent = datetime.fromtimestamp(int(tr["ts_entrada"]) / 1000.0, tz=TZ_UTC4)
         dt_sal = datetime.fromtimestamp(int(tr["ts_salida"]) / 1000.0, tz=TZ_UTC4)
         f_ent = dt_ent.strftime("%d/%m %H:%M")
@@ -143,7 +176,8 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
         comision_usdt = (p_ent * lotaje + p_sal_prom * lotaje) * TAKER_FEE
         pnl_bruto = float(tr["pnl_bruto"])
         pnl_neto = pnl_bruto - comision_usdt
-        r_mult = float(tr["r_mult"])
+        # R_Multiple Neto Real (incluyendo comisiones) para que la Expectativa sea 100% real
+        r_mult_neto = pnl_neto / RIESGO_USD if RIESGO_USD > 0 else float(tr["r_mult"])
         dec = 4 if p_ent < 10.0 else (1 if p_ent >= 1000.0 else 2)
 
         filas_nuevas.append({
@@ -168,7 +202,7 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
             "PnL_USDT": round(pnl_bruto, 2),
             "Comision_USDT": round(comision_usdt, 2),
             "PnL_Neto": round(pnl_neto, 2),
-            "R_Multiple": round(r_mult, 2),
+            "R_Multiple": round(r_mult_neto, 2),
             "Balance_USD": 0.0
         })
         claves_csv.add(clave_unica)
@@ -289,7 +323,7 @@ def generar_excel_profesional():
         ("A2:B2", "Capital Inicial:", "C2:D2", f"${CAPITAL_INICIAL:.2f}"),
         ("E2:F2", "Balance Neto Real:", "G2:H2", f"${bal_actual:.2f}"),
         ("I2:J2", "Win Rate Real (%):", "K2:L2", f"{wr_real:.1f}% ({total_trades} ops)"),
-        ("M2:N2", "Expectativa (en R):", "O2:P2", f"{exp_r:+.2f}R"),
+        ("M2:N2", "Expectativa Neta (R):", "O2:P2", f"{exp_r:+.2f}R"),
         ("Q2:S2", "Profit Factor Neto:", "T2:W2", f"{pf_neto:.2f}")
     ]
     kpis_f3 = [
@@ -301,7 +335,7 @@ def generar_excel_profesional():
     kpis_f4 = [
         ("A4:D4", "Win Rate ADX 25–34 (Zona Óptima):", "E4:H4", f"{wr_adx_opt:.1f}% WR ({n_opt} ops)"),
         ("I4:L4", "Win Rate Fuera Rango (<25 o >34):", "M4:P4", f"{wr_adx_out:.1f}% WR ({n_out} ops)"),
-        ("Q4:W4", f"Circuit Breaker: Max {MAX_SL_GLOBAL_DIA} SL/día Global | Micro-SL <0.25%", None, None)
+        ("Q4:W4", f"Freno Global: {MAX_SL_GLOBAL_DIA} SL/día | Cooldown BE + MTF 15/30m", None, None)
     ]
 
     for row_idx, kpi_list in [(2, kpis_f2), (3, kpis_f3), (4, kpis_f4)]:
@@ -465,7 +499,7 @@ def enviar_documento_bitacora(capital_actual, w_hoy, l_hoy, pnl_hoy, operar_find
         f"• <b>Trades registrados:</b> {total_regs}\n"
         f"• <b>Balance Neto Real:</b> ${capital_actual:.2f} USDT\n"
         f"• <b>Sesión Hoy:</b> {w_hoy}G - {l_hoy}P ({s_hoy}${abs(pnl_hoy):.2f} USDT)\n"
-        f"<i>TP1 1:1.5 / TP2 1:3.0 | Banda ADX 25-34 | Circuit Breaker {MAX_SL_GLOBAL_DIA} SL/día.</i>"
+        f"<i>TP1 1:1.5 / TP2 1:3.0 | ADX 25-34 | Cooldown BE + MTF Estricto + Freno {MAX_SL_GLOBAL_DIA} SL/día.</i>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
@@ -494,7 +528,7 @@ def cargar_estado():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                d.setdefault("motor", "pine_v387_cb_global")
+                d.setdefault("motor", "pine_v388_pro")
                 d.setdefault("ultima_hora_resumen", "")
                 d.setdefault("ultimo_cierre_dia", "")
                 d.setdefault("ultimo_ts_evento", {})
@@ -506,7 +540,7 @@ def cargar_estado():
         except Exception:
             pass
     return {
-        "motor": "pine_v387_cb_global", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
+        "motor": "pine_v388_pro", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
         "ultimo_ts_evento": {}, "operar_finde_activo": OPERAR_FINDE_DEFAULT,
         "last_update_id": 0, "capital_acumulado": CAPITAL_INICIAL, "trades_registrados": []
     }
@@ -514,7 +548,7 @@ def cargar_estado():
 
 def guardar_estado(estado):
     try:
-        estado["motor"] = "pine_v387_cb_global"
+        estado["motor"] = "pine_v388_pro"
         if len(estado.get("trades_registrados", [])) > 1000:
             estado["trades_registrados"] = estado["trades_registrados"][-1000:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -678,9 +712,9 @@ def obtener_config_activo(symbol):
 
 
 # ==============================================================================
-# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.7 (ADX 25-34 + 1:1.5 / 1:3.0)
+# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.8 (COOLDOWN BE + MTF ESTRICTO)
 # ==============================================================================
-def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_global_hoy=False):
+def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     df5 = fetch_klines(symbol, "5m", 1200)
     df15 = fetch_klines(symbol, "15m", 450)
     df30 = fetch_klines(symbol, "30m", 400)
@@ -774,15 +808,19 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_glo
                 l_fin += 1
                 pnl_fin -= RIESGO_USD
                 eventos_finde.append(ev)
-        else:
-            b_desde_sl += 1
-
-        if be_toc:
+        elif be_toc:
+            # MEJORA V3.8.8: Si se devuelve a Break-Even, activa Cooldown de 8 velas en esa direccion
+            if COOLDOWN_TRAS_BE:
+                ult_dir_sl, b_desde_sl = direccion, 0
+            else:
+                b_desde_sl += 1
             ev = {"ts": ts, "tipo": "BE", "par": symbol, "entrada": p_ent, "salida": p_ent, "pnl": 0.0}
             if es_hoy:
                 eventos_hoy.append(ev)
             if es_finde_rec:
                 eventos_finde.append(ev)
+        else:
+            b_desde_sl += 1
 
         if tp1_toc:
             racha_l = ult_dir_sl = 0
@@ -848,8 +886,13 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_glo
         e50_baj = ((not USAR_EMA50) or (close[i] < ema50[i] and ema21[i] < ema50[i])) and (m_di[i] > p_di[i])
 
         t15, t30 = bool(t15_arr[i]), bool(t30_arr[i])
-        mtf_alc = t15 and (t30 or (close[i] > vwap_val[i] and imp_alc)) and ((not USAR_VWAP) or close[i] > vwap_val[i])
-        mtf_baj = (not t15) and ((not t30) or (close[i] < vwap_val[i] and imp_baj)) and ((not USAR_VWAP) or close[i] < vwap_val[i])
+        if EXIGIR_MTF_ESTRICTO:
+            mtf_alc = t15 and t30 and ((not USAR_VWAP) or close[i] > vwap_val[i])
+            mtf_baj = (not t15) and (not t30) and ((not USAR_VWAP) or close[i] < vwap_val[i])
+        else:
+            mtf_alc = t15 and (t30 or (close[i] > vwap_val[i] and imp_alc)) and ((not USAR_VWAP) or close[i] > vwap_val[i])
+            mtf_baj = (not t15) and ((not t30) or (close[i] < vwap_val[i] and imp_baj)) and ((not USAR_VWAP) or close[i] < vwap_val[i])
+
         alin_alc = t15 and t30 and (close[i] > vwap_val[i]) and (ema21[i] > ema50[i])
         alin_baj = (not t15) and (not t30) and (close[i] < vwap_val[i]) and (ema21[i] < ema50[i])
 
@@ -861,7 +904,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_glo
         cam_l = not (USAR_SR and (not np.isnan(res_act)) and close[i] < res_act and (res_act - close[i]) < req_esp)
         cam_s = not (USAR_SR and (not np.isnan(sop_act)) and close[i] > sop_act and (close[i] - sop_act) < req_esp)
 
-        pausado = (racha_l >= MAX_DERROTAS) or (es_hoy and bloqueo_global_hoy)
+        pausado = racha_l >= MAX_DERROTAS
         no_ext = abs(close[i] - ema21[i]) <= (atr[i] * MAX_DIST_ATR)
         rng = high[i] - low[i]
         vf_l = (close[i] > open_p[i]) and ((not EXIGIR_VELA_FIRME) or rng == 0 or (high[i] - close[i]) <= rng * 0.42)
@@ -912,15 +955,13 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_glo
     req_u = (atr[u] * 1.5) * r_tp1 * ((MARGEN_MURO * 0.55) if (al_alc_u or al_baj_u) else MARGEN_MURO)
     m_res_u = USAR_SR and (not np.isnan(res_act)) and close[u] < res_act and (res_act - close[u]) < req_u
     m_sop_u = USAR_SR and (not np.isnan(sop_act)) and close[u] > sop_act and (close[u] - sop_act) < req_u
-    mtf_b_u = (not t15_u) and ((not t30_u) or (close[u] < vwap_val[u] and b_liq_baj <= 6)) and ((not USAR_VWAP) or close[u] < vwap_val[u])
+    mtf_b_u = (not t15_u) and (not t30_u) and ((not USAR_VWAP) or close[u] < vwap_val[u])
     bloq_m = ((-1 if mtf_b_u else 1) == 1 and m_res_u) or ((-1 if mtf_b_u else 1) == -1 and m_sop_u)
 
     if en_op:
         est_c = (f"🛡️ LONG BE ({fmt_p(p_ent)})" if tp1_hit else f"🟢 LONG ({fmt_p(p_ent)})") if direccion == 1 else (f"🛡️ SHORT BE ({fmt_p(p_ent)})" if tp1_hit else f"🔴 SHORT ({fmt_p(p_ent)})")
     elif cme_cerr_u:
         est_c = "🏦 CME CERRADO"
-    elif bloqueo_global_hoy:
-        est_c = f"🛑 FRENO GLOBAL ({MAX_SL_GLOBAL_DIA} SL/día)"
     elif racha_l >= MAX_DERROTAS:
         est_c = f"⛔ PAUSA PAR ({racha_l}/{MAX_DERROTAS})"
     elif bloq_m:
@@ -944,15 +985,13 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False, bloqueo_glo
 
 def obtener_resultados_mercado(f_hoy, op_finde):
     with ThreadPoolExecutor(max_workers=4) as ex:
-        res_map = dict(zip(SYMBOLS, ex.map(lambda s: analizar_moneda(s, f_hoy, op_finde, False), SYMBOLS)))
+        res_map = dict(zip(SYMBOLS, ex.map(lambda s: analizar_moneda(s, f_hoy, op_finde), SYMBOLS)))
     for sym in SYMBOLS:
         if res_map.get(sym) is None:
             time.sleep(1.5)
-            res_map[sym] = analizar_moneda(sym, f_hoy, op_finde, False)
+            res_map[sym] = analizar_moneda(sym, f_hoy, op_finde)
 
     res_list = [res_map[s] for s in SYMBOLS if res_map.get(s) is not None]
-
-    # Verificar Circuit Breaker Global Diario (si la cuenta suma >= MAX_SL_GLOBAL_DIA derrotas hoy)
     total_sl_hoy = sum(r["l_hoy"] for r in res_list)
     if total_sl_hoy >= MAX_SL_GLOBAL_DIA:
         for r in res_list:
@@ -972,7 +1011,7 @@ def formatear_alerta_evento(ev):
             f"<b>TP2 (1:{ev.get('ratio_tp2', 3.0):g}):</b> {fmt_p(ev['tp2'])}\n"
             f"<b>Lotaje (${RIESGO_USD:.0f}):</b> {ev['lotaje']:.3f}\n<b>Fecha/Hora:</b> {fh}"
         )
-    etiq = {"SL": "🔴 STOP LOSS (SL)", "TP1": "🎯 TAKE PROFIT 1 (SL a BE)", "TP2": "🏆 TAKE PROFIT 2 (FINAL)", "BE": "🛡️ BREAK-EVEN (SL)"}
+    etiq = {"SL": "🔴 STOP LOSS (SL)", "TP1": "🎯 TAKE PROFIT 1 (SL a BE)", "TP2": "🏆 TAKE PROFIT 2 (FINAL)", "BE": "🛡️ BREAK-EVEN (SL con Cooldown)"}
     s = "+" if ev["pnl"] > 0 else ("-" if ev["pnl"] < 0 else "")
     return (
         f"<b>{VERSION}</b>\n<b>Par:</b> {par}\n<b>Evento:</b> {etiq.get(t, t)}\n"
@@ -1066,8 +1105,9 @@ def main():
     if enviar_csv:
         enviar_documento_bitacora(cap_acum, sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list), sum(r["pnl_hoy"] for r in res_list), op_finde)
 
-    total_sl_hoy = sum(r["l_hoy"] for r in res_list)
-    bloqueo_global_activo = (total_sl_hoy >= MAX_SL_GLOBAL_DIA)
+    # Identificar si hoy ya se alcanzo el Circuit Breaker Global (3 SL) y a que hora exacta
+    sls_hoy_ts = sorted([ev["ts"] for r in res_list for ev in r["eventos"] if ev["tipo"] == "SL"])
+    ts_corte_hoy = sls_hoy_ts[MAX_SL_GLOBAL_DIA - 1] if len(sls_hoy_ts) >= MAX_SL_GLOBAL_DIA else None
 
     u_map = estado.setdefault("ultimo_ts_evento", {})
     for r in res_list:
@@ -1075,8 +1115,7 @@ def main():
         u_ts = int(u_map.get(sym, 0))
         for ev in r["eventos"]:
             if ev["ts"] > u_ts:
-                # Si ya salto el Circuit Breaker global hoy, no dispara nuevas entradas hoy
-                if bloqueo_global_activo and ev["tipo"] in ("ENTRY_LONG", "ENTRY_SHORT") and datetime.fromtimestamp(ev["ts"] / 1000.0, tz=TZ_UTC4).date() == f_hoy:
+                if ts_corte_hoy is not None and ev["ts"] > ts_corte_hoy and ev["tipo"] in ("ENTRY_LONG", "ENTRY_SHORT"):
                     u_map[sym] = ev["ts"]
                     cambios = True
                     continue
