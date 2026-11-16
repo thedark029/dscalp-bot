@@ -144,11 +144,23 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
     except Exception:
         df_exist = pd.DataFrame(columns=ENCABEZADOS_BITACORA)
 
+    anio_actual = datetime.now(TZ_UTC4).year
     trades_reg = set(estado.get("trades_registrados", []))
     claves_csv = set()
+    intervalos_por_ticker = {}
+
     if not df_exist.empty:
         for _, r in df_exist.iterrows():
-            claves_csv.add((str(r["Ticker"]).strip(), str(r["Fecha_Entrada"]).strip()))
+            tk_ex = str(r["Ticker"]).strip()
+            fe_ex = str(r["Fecha_Entrada"]).strip()
+            fs_ex = str(r["Fecha_Salida"]).strip()
+            claves_csv.add((tk_ex, fe_ex))
+            try:
+                dt_e_ex = datetime.strptime(f"{fe_ex}/{anio_actual}", "%d/%m %H:%M/%Y").replace(tzinfo=TZ_UTC4)
+                dt_s_ex = datetime.strptime(f"{fs_ex}/{anio_actual}", "%d/%m %H:%M/%Y").replace(tzinfo=TZ_UTC4)
+                intervalos_por_ticker.setdefault(tk_ex, []).append((dt_e_ex, dt_s_ex))
+            except Exception:
+                pass
 
     filas_nuevas = []
     for tr in trades_validos:
@@ -156,9 +168,20 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
         dt_sal = datetime.fromtimestamp(int(tr["ts_salida"]) / 1000.0, tz=TZ_UTC4)
         f_ent = dt_ent.strftime("%d/%m %H:%M")
         f_sal = dt_sal.strftime("%d/%m %H:%M")
-        clave_unica = (str(tr["ticker"]).strip(), f_ent)
+        tk_actual = str(tr["ticker"]).strip()
+        clave_unica = (tk_actual, f_ent)
 
         if clave_unica in claves_csv:
+            trades_reg.add(tr["uid"])
+            continue
+
+        # Bloqueo anti-solapamiento: evita registrar trades fantasma si ya existe una operacion activa en ese rango horario
+        solapado = False
+        for int_e, int_s in intervalos_por_ticker.get(tk_actual, []):
+            if dt_ent < int_s and dt_sal > int_e:
+                solapado = True
+                break
+        if solapado:
             trades_reg.add(tr["uid"])
             continue
 
@@ -206,6 +229,7 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
             "Balance_USD": 0.0
         })
         claves_csv.add(clave_unica)
+        intervalos_por_ticker.setdefault(tk_actual, []).append((dt_ent, dt_sal))
         trades_reg.add(tr["uid"])
 
     if not filas_nuevas and not df_exist.empty:
@@ -220,7 +244,6 @@ def sincronizar_bitacora_completa(trades_detectados, estado):
         estado["trades_registrados"] = list(trades_reg)
         return CAPITAL_INICIAL, False
 
-    anio_actual = datetime.now(TZ_UTC4).year
     df_total["_dt_sal"] = pd.to_datetime(df_total["Fecha_Salida"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
     df_total["_dt_ent"] = pd.to_datetime(df_total["Fecha_Entrada"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
     df_total = df_total.sort_values(["_dt_sal", "_dt_ent", "Ticker"]).drop(columns=["_dt_sal", "_dt_ent"]).reset_index(drop=True)
@@ -765,13 +788,14 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
         if np.all(low[c_idx] <= low[c_idx - PIV_LEN:c_idx]) and np.all(low[c_idx] < low[c_idx + 1:c_idx + PIV_LEN + 1]):
             sop_act = low[c_idx]
 
-        if i < 55 or np.isnan(atr[i]) or np.isnan(ema50[i]) or np.isnan(adx_val[i]):
+        # Exigir al menos 288 velas (24h completas) de calentamiento para estabilizar RMA/EMA/VWAP UTC
+        if i < 288 or np.isnan(atr[i]) or np.isnan(ema50[i]) or np.isnan(adx_val[i]):
             continue
 
         ts = int(ts_arr[i])
         dt_loc = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
         es_hoy = (dt_loc.date() == fecha_hoy_utc4)
-        es_reciente_bitacora = ((fecha_hoy_utc4 - dt_loc.date()).days <= 4)
+        es_reciente_bitacora = ((fecha_hoy_utc4 - dt_loc.date()).days <= 2)
 
         min_r, max_r = np.min(low[i - 12:i]), np.max(high[i - 12:i])
         b_alc = (low[i] < min_r) and (close[i] > min_r) and ((min(open_p[i], close[i]) - low[i]) > atr[i] * 0.35)
@@ -782,7 +806,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
 
         h_loc, m_loc, d_sem = dt_loc.hour, dt_loc.minute, dt_loc.weekday()
         es_finde = d_sem in (5, 6)
-        es_finde_rec = es_finde and ((fecha_hoy_utc4 - dt_loc.date()).days <= 3)
+        es_finde_rec = es_finde and ((fecha_hoy_utc4 - dt_loc.date()).days <= 2)
         cierre_vie_cme = es_metal and BLOQUEO_CME_METALES and (d_sem == 4) and (h_loc > 16 or (h_loc == 16 and m_loc >= 30))
         dia_hab = not (es_finde and ((es_metal and BLOQUEO_CME_METALES) or (not operar_finde_flag)))
         en_horario = (HORA_INICIO <= h_loc < HORA_FIN) and dia_hab and (not cierre_vie_cme)
@@ -949,7 +973,7 @@ def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
     adx_ok_u = (cfg_adx <= adx_val[u] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[u] >= cfg_adx)
     adx_sub_u = (adx_val[u] >= adx_val[u - 1]) or (adx_val[u] >= 28.0)
     f_ult = adx_ok_u and adx_sub_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12) and (not micro_stop_u)
-    t15_u, t30_u = bool(t15_arr[u]), bool(t30_arr[u])
+    t15_u, t30_u = bool(t15_arr[u]), bool(t15_arr[u]) if False else bool(t30_arr[u])
     al_alc_u = t15_u and t30_u and (close[u] > vwap_val[u]) and (ema21[u] > ema50[u])
     al_baj_u = (not t15_u) and (not t30_u) and (close[u] < vwap_val[u]) and (ema21[u] < ema50[u])
     req_u = (atr[u] * 1.5) * r_tp1 * ((MARGEN_MURO * 0.55) if (al_alc_u or al_baj_u) else MARGEN_MURO)
