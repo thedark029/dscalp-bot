@@ -1,1 +1,2 @@
 UID,ID_Trade,Fecha_Entrada,Fecha_Salida,TS_Entrada_MS,TS_Salida_MS,Duracion_Min,Sesion,Ticker,Direccion,Entrada,Salida_Prom_Ponderada,SL_Inicial,Distancia_SL_%,TP1,TP2,Lotaje,Valor_Nocional,NATR_Mult,ADX_Entr,Resultado,PnL_USDT,Comision_USDT,PnL_Neto,R_Multiple,Balance_USD
+XRPUSDT_1795522500000,#001,24/11 08:15,24/11 09:15,1795522500000,1795526100000,60,NY Open,XRPUSDT,SHORT,0.9297,0.920278,0.933888,0.0045,0.923419,0.917137,477.611,444.03,1.65,25.7,TP2,4.5,0.53,3.97,1.99,103.97
