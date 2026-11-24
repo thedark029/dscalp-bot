@@ -13,6 +13,7 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.chart import LineChart, BarChart, Reference
 
 # ==============================================================================
 # 1. CONFIGURACIÓN GLOBAL DEL SISTEMA (V3.9)
@@ -849,12 +850,31 @@ def aplicar_filtros_cartera(
 
 
 # ==============================================================================
-# 6. GENERACIÓN DE BITÁCORA EXCEL CUANTITATIVA (Bitacora_DScalp_PRO.xlsx)
+# 6. GENERACIÓN DE BITÁCORA EXCEL + DASHBOARD CUANTITATIVO (Bitacora_DScalp_PRO.xlsx)
 # ==============================================================================
+def _metricas_grupo(sub: pd.DataFrame) -> tuple:
+    n = len(sub)
+    if n == 0:
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+    gan = int(sub["Resultado"].astype(str).str.startswith("TP").sum())
+    perd = int((sub["Resultado"].astype(str) == "SL").sum())
+    wr = gan / n
+    pnl_b = round(float(sub["PnL_USDT"].sum()), 2)
+    com = round(float(sub["Comision_USDT"].sum()), 2)
+    pnl_n = round(float(sub["PnL_Neto"].sum()), 2)
+    exp_r = round(float(sub["R_Multiple"].mean()), 2)
+    return n, gan, perd, wr, pnl_b, com, pnl_n, exp_r
+
+
 def generar_excel_bitacora(df: pd.DataFrame) -> None:
     wb = Workbook()
+
+    # --------------------------------------------------------------------------
+    # HOJA 1: Bitacora_DScalp (Estática en A6 + Filtros + Colores Semánticos)
+    # --------------------------------------------------------------------------
     ws = wb.active
     ws.title = "Bitacora_DScalp"
+    ws.freeze_panes = "A6"
 
     n_ops = len(df)
     if n_ops > 0:
@@ -867,7 +887,7 @@ def generar_excel_bitacora(df: pd.DataFrame) -> None:
         exp_r = float(df["R_Multiple"].mean())
         gan_neta = float(df[df["PnL_Neto"] > 0]["PnL_Neto"].sum())
         perd_neta = abs(float(df[df["PnL_Neto"] < 0]["PnL_Neto"].sum()))
-        pf_neto = (gan_neta / perd_neta) if perd_neta > 0 else 0.0
+        pf_txt = f"{(gan_neta / perd_neta):.2f}" if perd_neta > 0 else ("∞" if gan_neta > 0 else "0.00")
 
         curva = [CAPITAL_INICIAL] + df["Balance_USD"].tolist()
         pico = CAPITAL_INICIAL
@@ -876,64 +896,384 @@ def generar_excel_bitacora(df: pd.DataFrame) -> None:
             pico = max(pico, float(b))
             max_dd = max(max_dd, pico - float(b))
     else:
-        wr_pct = pnl_bruto = comis_tot = pnl_neto = exp_r = pf_neto = max_dd = 0.0
+        wr_pct = pnl_bruto = comis_tot = pnl_neto = exp_r = max_dd = 0.0
         bal_real = CAPITAL_INICIAL
+        pf_txt = "0.00"
 
-    ws.cell(1, 1, f"⚡ {VERSION} (1:1.5 / 1:3.0) — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)")
-    ws.cell(1, 1).font = Font(bold=True, size=11, color="FFFFFF")
-    for col_i in range(1, 24):
-        ws.cell(1, col_i).fill = PatternFill("solid", fgColor="0F172A")
+    # Paleta visual consistente con v3.8.8 (optimizada para escritorio y móvil)
+    fill_banner = PatternFill("solid", fgColor="111827")
+    fill_kpi = PatternFill("solid", fgColor="1F2937")
+    fill_header = PatternFill("solid", fgColor="0F172A")
+    fill_subhdr = PatternFill("solid", fgColor="1E293B")
+    fill_zebra = PatternFill("solid", fgColor="F8FAFC")
+    fill_total = PatternFill("solid", fgColor="E2E8F0")
 
-    ws.cell(2, 1, "Capital Inicial:")
-    ws.cell(2, 3, f"${CAPITAL_INICIAL:.2f}")
-    ws.cell(2, 5, "Balance Neto Real:")
-    ws.cell(2, 7, f"${bal_real:.2f}")
-    ws.cell(2, 9, "Win Rate Real (%):")
-    ws.cell(2, 11, f"{wr_pct:.1f}% ({n_ops} ops)")
-    ws.cell(2, 13, "Expectativa Neta (R):")
-    ws.cell(2, 15, f"{exp_r:+.2f}R")
-    ws.cell(2, 17, "Profit Factor Neto:")
-    ws.cell(2, 20, f"{pf_neto:.2f}")
+    font_banner = Font(bold=True, size=11, color="FFFFFF")
+    font_kpi_lbl = Font(bold=True, size=9, color="9CA3AF")
+    font_kpi_val = Font(bold=True, size=10, color="38BDF8")
+    font_header = Font(bold=True, size=10, color="FFFFFF")
+    font_data = Font(size=10, color="111827")
+    font_muted = Font(size=10, color="64748B")
+    font_bold = Font(bold=True, size=10, color="0F172A")
 
-    ws.cell(3, 1, "PnL Bruto Acum.:")
-    ws.cell(3, 3, f"{pnl_bruto:+.2f} USDT")
-    ws.cell(3, 5, "Comisiones (0.12%):")
-    ws.cell(3, 7, f"-${comis_tot:.2f} USDT")
-    ws.cell(3, 9, "PnL Neto Real:")
-    ws.cell(3, 11, f"{pnl_neto:+.2f} USDT")
-    ws.cell(3, 13, "Max Drawdown ($):")
-    ws.cell(3, 16, f"-${max_dd:.2f} USD")
+    fill_tp2 = PatternFill("solid", fgColor="D1FAE5")
+    font_tp2 = Font(bold=True, size=10, color="065F46")
+    fill_be = PatternFill("solid", fgColor="DBEAFE")
+    font_be = Font(bold=True, size=10, color="1E40AF")
+    fill_sl = PatternFill("solid", fgColor="FEE2E2")
+    font_sl = Font(bold=True, size=10, color="991B1B")
 
-    ws.cell(4, 1, "Win Rate ADX 25–34 (Zona Óptima):")
-    ws.cell(4, 5, f"{wr_pct:.1f}% WR ({n_ops} ops)")
-    ws.cell(4, 9, "Win Rate Fuera Rango (<25 o >34):")
-    ws.cell(4, 13, "0.0% WR (0 ops)")
-    ws.cell(4, 17, "Freno Global: 3 SL/día | Máx 2 Pos. Simultáneas | Sesión NY Open 08–13h")
-
-    export_cols = [c for c in CSV_COLUMNS if c not in ("UID", "TS_Entrada_MS", "TS_Salida_MS")]
-    header_fill = PatternFill("solid", fgColor="1E293B")
-    header_font = Font(bold=True, color="FFFFFF", size=10)
     thin_border = Border(
         left=Side(style="thin", color="CBD5E1"),
         right=Side(style="thin", color="CBD5E1"),
         top=Side(style="thin", color="CBD5E1"),
         bottom=Side(style="thin", color="CBD5E1"),
     )
+    kpi_border = Border(
+        left=Side(style="thin", color="374151"),
+        right=Side(style="thin", color="374151"),
+        top=Side(style="thin", color="374151"),
+        bottom=Side(style="thin", color="374151"),
+    )
 
+    ws.merge_cells("A1:W1")
+    ws.cell(1, 1, f"⚡ {VERSION} (1:1.5 / 1:3.0) — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)")
+    for col_i in range(1, 24):
+        c = ws.cell(1, col_i)
+        c.fill = fill_banner
+        c.font = font_banner
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    for r_i in range(2, 5):
+        for col_i in range(1, 24):
+            c = ws.cell(r_i, col_i)
+            c.fill = fill_kpi
+            c.border = kpi_border
+            c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    merges_kpi = [
+        "A2:B2", "C2:D2", "E2:F2", "G2:H2", "I2:J2", "K2:L2", "M2:N2", "O2:P2", "Q2:S2", "T2:W2",
+        "A3:B3", "C3:D3", "E3:F3", "G3:H3", "I3:J3", "K3:L3", "M3:O3", "P3:W3",
+        "A4:D4", "E4:H4", "I4:L4", "M4:P4", "Q4:W4",
+    ]
+    for rng in merges_kpi:
+        ws.merge_cells(rng)
+
+    kpis = [
+        (2, 1, "Capital Inicial:", True), (2, 3, f"${CAPITAL_INICIAL:.2f}", False),
+        (2, 5, "Balance Neto Real:", True), (2, 7, f"${bal_real:.2f}", False),
+        (2, 9, "Win Rate Real (%):", True), (2, 11, f"{wr_pct:.1f}% ({n_ops} ops)", False),
+        (2, 13, "Expectativa Neta (R):", True), (2, 15, f"{exp_r:+.2f}R", False),
+        (2, 17, "Profit Factor Neto:", True), (2, 20, pf_txt, False),
+        (3, 1, "PnL Bruto Acum.:", True), (3, 3, f"{pnl_bruto:+.2f} USDT", False),
+        (3, 5, "Comisiones (0.12%):", True), (3, 7, f"-${comis_tot:.2f} USDT", False),
+        (3, 9, "PnL Neto Real:", True), (3, 11, f"{pnl_neto:+.2f} USDT", False),
+        (3, 13, "Max Drawdown ($):", True), (3, 16, f"-${max_dd:.2f} USD", False),
+        (4, 1, "Win Rate ADX 25–34 (Zona Óptima):", True), (4, 5, f"{wr_pct:.1f}% WR ({n_ops} ops)", False),
+        (4, 9, "Win Rate Fuera Rango (<25 o >34):", True), (4, 13, "0.0% WR (0 ops)", False),
+        (4, 17, "Freno Global: 3 SL/día | Máx 2 Pos. | NY Open 08–13h", True),
+    ]
+    for r_i, c_i, texto, es_lbl in kpis:
+        cell = ws.cell(r_i, c_i, texto)
+        cell.font = font_kpi_lbl if es_lbl else font_kpi_val
+
+    export_cols = [c for c in CSV_COLUMNS if c not in ("UID", "TS_Entrada_MS", "TS_Salida_MS")]
     for c_idx, col_name in enumerate(export_cols, start=1):
         cell = ws.cell(5, c_idx, col_name)
-        cell.fill = header_fill
-        cell.font = header_font
+        cell.fill = fill_header
+        cell.font = font_header
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = thin_border
 
+    ws.auto_filter.ref = f"A5:W{max(5, 5 + n_ops)}"
+
     if n_ops > 0:
         for r_idx, (_, row) in enumerate(df.iterrows(), start=6):
+            res_str = str(row["Resultado"])
+            ticker_str = str(row["Ticker"])
+            es_par_fila = (r_idx % 2 == 0)
+            precio_fmt = (
+                "0.0000" if ticker_str in ("XRPUSDT", "ADAUSDT", "SUIUSDT")
+                else ("0.00" if ticker_str in ("XAGUSDT", "SOLUSDT", "BNBUSDT", "ZECUSDT") else "0.0")
+            )
+
             for c_idx, col_name in enumerate(export_cols, start=1):
                 val = row[col_name]
                 cell = ws.cell(r_idx, c_idx, val)
                 cell.border = thin_border
-                cell.alignment = Alignment(horizontal="center")
+                cell.font = font_data
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if es_par_fila:
+                    cell.fill = fill_zebra
+
+                if col_name == "Duracion_Min":
+                    cell.number_format = '0" min"'
+                elif col_name in ("Entrada", "Salida_Prom_Ponderada", "SL_Inicial", "TP1", "TP2"):
+                    cell.number_format = precio_fmt
+                elif col_name == "Distancia_SL_%":
+                    cell.number_format = "0.00%"
+                elif col_name == "Lotaje":
+                    cell.number_format = "0.000"
+                elif col_name in ("Valor_Nocional", "Comision_USDT", "Balance_USD"):
+                    cell.number_format = "$#,##0.00"
+                elif col_name == "NATR_Mult":
+                    cell.number_format = '0.00"x"'
+                elif col_name == "ADX_Entr":
+                    cell.number_format = "0.0"
+                elif col_name in ("PnL_USDT", "PnL_Neto"):
+                    cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
+                elif col_name == "R_Multiple":
+                    cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
+
+                if col_name in ("Resultado", "PnL_USDT", "PnL_Neto", "R_Multiple"):
+                    if res_str == "TP2":
+                        cell.fill = fill_tp2
+                        cell.font = font_tp2
+                    elif res_str.startswith("TP1"):
+                        cell.fill = fill_be
+                        cell.font = font_be
+                    elif res_str == "SL":
+                        cell.fill = fill_sl
+                        cell.font = font_sl
+
+    ws.row_dimensions[1].height = 24.0
+    ws.row_dimensions[2].height = 20.0
+    ws.row_dimensions[3].height = 20.0
+    ws.row_dimensions[4].height = 20.0
+    ws.row_dimensions[5].height = 22.0
+    for r_idx in range(6, 6 + n_ops):
+        ws.row_dimensions[r_idx].height = 19.0
+
+    col_widths = {
+        "A": 10.0, "B": 15.0, "C": 15.0, "D": 13.0, "E": 13.0, "F": 12.0,
+        "G": 10.0, "H": 12.0, "I": 20.0, "J": 12.0, "K": 15.0, "L": 12.0,
+        "M": 12.0, "N": 11.0, "O": 15.0, "P": 12.0, "Q": 12.0, "R": 12.0,
+        "S": 13.0, "T": 14.0, "U": 13.0, "V": 12.0, "W": 14.0,
+    }
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    # --------------------------------------------------------------------------
+    # HOJA 2: Dashboard_V39 (Desglose por Activo, Dirección y Gráficas Nativas)
+    # --------------------------------------------------------------------------
+    wd = wb.create_sheet(title="Dashboard_V39")
+    wd.freeze_panes = "A3"
+
+    wd.merge_cells("A1:I1")
+    wd.cell(1, 1, f"📊 {VERSION} — DASHBOARD CUANTITATIVO (ACTIVOS, DIRECCIÓN Y CURVA DE EQUITY)")
+    for c_i in range(1, 10):
+        cell = wd.cell(1, c_i)
+        cell.fill = fill_banner
+        cell.font = font_banner
+        cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    wd.row_dimensions[1].height = 24.0
+    wd.row_dimensions[2].height = 8.0
+
+    # Bloque 1: Rendimiento por Activo (Filas 3..13)
+    wd.merge_cells("A3:I3")
+    wd.cell(3, 1, "1. RENDIMIENTO NETO POR ACTIVO (DESCONTANDO 0.12% RT BITGET)")
+    for c_i in range(1, 10):
+        c = wd.cell(3, c_i)
+        c.fill = fill_subhdr
+        c.font = font_header
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    wd.row_dimensions[3].height = 20.0
+
+    dash_headers = ["Activo", "Ops", "Ganadas", "Perdidas", "Win Rate", "PnL Bruto", "Comisiones", "PnL Neto", "Exp. (R)"]
+    for c_i, h_txt in enumerate(dash_headers, start=1):
+        c = wd.cell(4, c_i, h_txt)
+        c.fill = fill_header
+        c.font = font_header
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = thin_border
+    wd.row_dimensions[4].height = 21.0
+
+    for idx, sym in enumerate(SYMBOLS, start=5):
+        sub = df[df["Ticker"] == sym] if n_ops > 0 else df
+        m_ops, m_gan, m_perd, m_wr, m_pb, m_com, m_pn, m_er = _metricas_grupo(sub)
+        vals = [sym, m_ops, m_gan, m_perd, m_wr, m_pb, m_com, m_pn, m_er]
+        es_par = (idx % 2 == 0)
+        for c_i, v in enumerate(vals, start=1):
+            cell = wd.cell(idx, c_i, v)
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.font = font_muted if m_ops == 0 else (font_bold if c_i == 1 else font_data)
+            if es_par:
+                cell.fill = fill_zebra
+            if c_i == 5:
+                cell.number_format = "0.0%"
+            elif c_i in (6, 8):
+                cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
+            elif c_i == 7:
+                cell.number_format = "$#,##0.00"
+            elif c_i == 9:
+                cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
+
+            if m_ops > 0 and c_i in (8, 9):
+                if m_pn > 0:
+                    cell.fill = fill_tp2
+                    cell.font = font_tp2
+                elif m_pn < 0:
+                    cell.fill = fill_sl
+                    cell.font = font_sl
+        wd.row_dimensions[idx].height = 19.0
+
+    # Fila 13: Total General
+    t_ops, t_gan, t_perd, t_wr, t_pb, t_com, t_pn, t_er = _metricas_grupo(df)
+    tot_vals = ["TOTAL", t_ops, t_gan, t_perd, t_wr, t_pb, t_com, t_pn, t_er]
+    for c_i, v in enumerate(tot_vals, start=1):
+        cell = wd.cell(13, c_i, v)
+        cell.border = thin_border
+        cell.fill = fill_total
+        cell.font = font_bold
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        if c_i == 5:
+            cell.number_format = "0.0%"
+        elif c_i in (6, 8):
+            cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
+        elif c_i == 7:
+            cell.number_format = "$#,##0.00"
+        elif c_i == 9:
+            cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
+        if t_ops > 0 and c_i in (8, 9):
+            if t_pn > 0:
+                cell.fill = fill_tp2
+                cell.font = font_tp2
+            elif t_pn < 0:
+                cell.fill = fill_sl
+                cell.font = font_sl
+    wd.row_dimensions[13].height = 20.0
+    wd.row_dimensions[14].height = 10.0
+
+    # Bloque 2: Rendimiento por Dirección LONG vs SHORT (Filas 15..18)
+    wd.merge_cells("A15:I15")
+    wd.cell(15, 1, "2. RENDIMIENTO POR DIRECCIÓN (LONG VS SHORT)")
+    for c_i in range(1, 10):
+        c = wd.cell(15, c_i)
+        c.fill = fill_subhdr
+        c.font = font_header
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    wd.row_dimensions[15].height = 20.0
+
+    dir_headers = ["Dirección", "Ops", "Ganadas", "Perdidas", "Win Rate", "PnL Bruto", "Comisiones", "PnL Neto", "Exp. (R)"]
+    for c_i, h_txt in enumerate(dir_headers, start=1):
+        c = wd.cell(16, c_i, h_txt)
+        c.fill = fill_header
+        c.font = font_header
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = thin_border
+    wd.row_dimensions[16].height = 21.0
+
+    for offset, d_lbl in enumerate(["LONG", "SHORT"], start=17):
+        sub_d = df[df["Direccion"] == d_lbl] if n_ops > 0 else df
+        d_ops, d_gan, d_perd, d_wr, d_pb, d_com, d_pn, d_er = _metricas_grupo(sub_d)
+        vals = [d_lbl, d_ops, d_gan, d_perd, d_wr, d_pb, d_com, d_pn, d_er]
+        for c_i, v in enumerate(vals, start=1):
+            cell = wd.cell(offset, c_i, v)
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.font = font_muted if d_ops == 0 else (font_bold if c_i == 1 else font_data)
+            if c_i == 5:
+                cell.number_format = "0.0%"
+            elif c_i in (6, 8):
+                cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
+            elif c_i == 7:
+                cell.number_format = "$#,##0.00"
+            elif c_i == 9:
+                cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
+            if d_ops > 0 and c_i in (8, 9):
+                if d_pn > 0:
+                    cell.fill = fill_tp2
+                    cell.font = font_tp2
+                elif d_pn < 0:
+                    cell.fill = fill_sl
+                    cell.font = font_sl
+        wd.row_dimensions[offset].height = 19.0
+
+    # Tabla Serie de Equity en columnas K:L (alimenta la gráfica de línea)
+    wd.merge_cells("K3:L3")
+    wd.cell(3, 11, "SERIE DE EQUITY")
+    for c_i in (11, 12):
+        c = wd.cell(3, c_i)
+        c.fill = fill_subhdr
+        c.font = font_header
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    for c_i, h_txt in [(11, "Trade"), (12, "Balance (USD)")]:
+        c = wd.cell(4, c_i, h_txt)
+        c.fill = fill_header
+        c.font = font_header
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = thin_border
+
+    c_t0 = wd.cell(5, 11, "Inicio")
+    c_b0 = wd.cell(5, 12, round(CAPITAL_INICIAL, 2))
+    for c in (c_t0, c_b0):
+        c.border = thin_border
+        c.font = font_data
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    c_b0.number_format = "$#,##0.00"
+
+    if n_ops > 0:
+        for i_eq, (_, row) in enumerate(df.iterrows(), start=6):
+            ct = wd.cell(i_eq, 11, str(row["ID_Trade"]))
+            cb = wd.cell(i_eq, 12, round(float(row["Balance_USD"]), 2))
+            for c in (ct, cb):
+                c.border = thin_border
+                c.font = font_data
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            cb.number_format = "$#,##0.00"
+
+    # Gráfica 1: Curva de Equity Neta (LineChart) en A20
+    last_eq_row = 5 + n_ops
+    if n_ops >= 1:
+        chart_eq = LineChart()
+        chart_eq.title = f"Curva de Equity Neta ({VERSION})"
+        chart_eq.style = 10
+        chart_eq.y_axis.title = "Balance (USD)"
+        chart_eq.x_axis.title = "Operación"
+        chart_eq.legend = None
+        chart_eq.width = 18.5
+        chart_eq.height = 8.2
+
+        data_eq = Reference(wd, min_col=12, min_row=4, max_row=last_eq_row)
+        cats_eq = Reference(wd, min_col=11, min_row=5, max_row=last_eq_row)
+        chart_eq.add_data(data_eq, titles_from_data=True)
+        chart_eq.set_categories(cats_eq)
+        if chart_eq.series:
+            s0 = chart_eq.series[0]
+            s0.graphicalProperties.line.solidFill = "0284C7"
+            s0.graphicalProperties.line.width = 26000
+            s0.marker.symbol = "circle"
+            s0.marker.size = 5
+        wd.add_chart(chart_eq, "A20")
+
+    # Gráfica 2: PnL Neto por Activo (BarChart) en A37 (o A20 si aún hay 0 ops)
+    chart_bar = BarChart()
+    chart_bar.type = "col"
+    chart_bar.title = "PnL Neto por Activo (USDT)"
+    chart_bar.style = 10
+    chart_bar.y_axis.title = "PnL Neto (USDT)"
+    chart_bar.x_axis.title = "Par"
+    chart_bar.legend = None
+    chart_bar.width = 18.5
+    chart_bar.height = 8.2
+
+    data_bar = Reference(wd, min_col=8, min_row=4, max_row=12)
+    cats_bar = Reference(wd, min_col=1, min_row=5, max_row=12)
+    chart_bar.add_data(data_bar, titles_from_data=True)
+    chart_bar.set_categories(cats_bar)
+    if chart_bar.series:
+        chart_bar.series[0].graphicalProperties.solidFill = "0F766E"
+    wd.add_chart(chart_bar, "A37" if n_ops >= 1 else "A20")
+
+    dash_widths = {
+        "A": 13.0, "B": 8.0, "C": 10.0, "D": 10.0, "E": 12.0,
+        "F": 13.0, "G": 13.0, "H": 13.0, "I": 11.0,
+        "J": 3.0, "K": 11.0, "L": 15.0,
+    }
+    for col_letter, width in dash_widths.items():
+        wd.column_dimensions[col_letter].width = width
 
     wb.save(XLSX_FILE)
 
