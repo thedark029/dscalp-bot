@@ -1,1183 +1,1217 @@
-import os, csv, json, time, warnings, requests, urllib3
-import numpy as np
+# ==============================================================================
+# D-SCALP PRO V3.9 — BOT CUANTITATIVO MULTI-ACTIVO (BITGET V2 + TELEGRAM + EXCEL)
+# Autor: Sebastián Mirabal | Arquitectura: Orion
+# Sincronizado 1:1 con Pine Script v6 (⚡ D-Scalp PRO 1:3 [V3.9 Multi-Asset])
+# ==============================================================================
+
+import os
+import json
+import time
+import math
+import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-
-warnings.filterwarnings("ignore")
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-# 1. PARAMETROS GLOBALES V3.8.8 (1:1.5 / 1:3.0 + COOLDOWN BE + MTF ESTRICTO)
+# 1. CONFIGURACIÓN GLOBAL DEL SISTEMA (V3.9)
 # ==============================================================================
-VERSION = "D-SCALP V3.8.8"
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "XAGUSDT", "XAUTUSDT", "ZECUSDT"]
+VERSION = "D-SCALP V3.9"
+MOTOR_ID = "pine_v39_pro"
+USER_AGENT = "DScalpBot-PineClone/3.9"
+
+# Soporta ambos nombres de secretos en GitHub Actions (TELEGRAM_CHAT_ID o CHAT_ID)
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
+
+BITGET_CANDLES_URL = "https://api.bitget.com/api/v2/mix/market/candles"
+PRODUCT_TYPE = "USDT-FUTURES"
+
+# Ordenados por prioridad de liquidez (desempate determinista para MAX_POSICIONES_SIMULTANEAS)
+SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "XAGUSDT",
+    "XAUTUSDT",
+    "ZECUSDT",
+]
+
+# Parámetros de Riesgo, Cartera y Sesión (UTC-4 Venezuela)
+TZ_UTC4 = timezone(timedelta(hours=-4))
+TS_INICIO_V39_MS = 1795521600000  # 24/11/2026 08:00:00 UTC-4 (Arranque limpio V3.9)
 
 CAPITAL_INICIAL = 100.0
-RIESGO_PORC = 2.0
-RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PORC / 100.0)
-MAX_DERROTAS = 2              # Max 2 SL seguidos por moneda en el dia
-MAX_SL_GLOBAL_DIA = 3         # Circuit Breaker Global: corta nuevas entradas tras 3 SL diarios
-TAKER_FEE = 0.0006            # 0.06% Taker Fee por orden (0.12% redondo apertura + cierre)
+RIESGO_PCT = 2.0
+RIESGO_USD = CAPITAL_INICIAL * (RIESGO_PCT / 100.0)  # $2.00 por operación
+TP1_MULT = 1.5
+TP2_MULT = 3.0
+COMISION_RT = 0.0012  # 0.06% Taker entrada + 0.06% Taker salida = 0.12% RT
 
-AUTO_DETECT = True
-MULTIPLICADOR_ATR_MAN = 1.5
-ADX_MIN_MAN = 25.0            # Piso ADX 25.0 (elimina entradas sin impulso < 25)
-RATIO_TP1_MAN = 1.5           # TP1 a 1.5R (asegura parcial y mueve SL a BE 25% antes)
-RATIO_TP2_MAN = 3.0           # TP2 a 3.0R (objetivo realista intradia en 5m)
-USAR_NATR = True
-NATR_SMA_LEN = 50
-NATR_MIN_SC = 1.00
-NATR_MAX_SC = 1.15
-
-# Filtros de precision cuantitativa ACTIVADOS (Sincronizados 100% con Pine Script V3.8.8)
-USAR_TECHO_ADX = True
-ADX_MAX_MAN = 34.0            # Techo ADX 34.0 (captura aperturas NY 25-34, bloquea climax > 34)
-USAR_PISO_SL = True
-EXIGIR_MTF_ESTRICTO = True    # Exige 15m y 30m alineados (evita compras/ventas contra 30m)
-COOLDOWN_TRAS_BE = True       # Activa enfriamiento de 8 velas tambien tras cierre en Break-Even
-
-USAR_EMA50 = True
-USAR_SR = True
-PIV_LEN = 8
-MARGEN_MURO = 0.65
-USAR_VWAP = True
-
-OPERAR_FINDE_DEFAULT = False
-BLOQUEO_CME_METALES = True
-EXIGIR_VELA_FIRME = True
-MAX_DIST_ATR = 1.25
-VELAS_COOLDOWN = 8
-PERMITIR_SHORTS = True
 HORA_INICIO = 8
-HORA_FIN = 20
+HORA_FIN = 13  # V3.9: Solo NY Open (08:00 - 12:59 UTC-4); eliminada NY Tarde
+COOLDOWN_VELAS = 8
 
-STATE_FILE = "estado_bot.json"
-BITACORA_FILE = "bitacora_dscalp.csv"
-EXCEL_FILE = "Bitacora_DScalp_PRO.xlsx"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+MAX_DERROTAS_PAR_DIA = 2
+MAX_SL_GLOBAL_DIA = 3
+MAX_POSICIONES_SIMULTANEAS = 2  # V3.9: Límite global de exposición simultánea
 
-TZ_UTC4 = timezone(timedelta(hours=-4))
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "DScalpBot-PineClone/3.8.8"})
+# Parámetros Técnicos (Idénticos a Pine Script v6)
+EMA_FAST_LEN = 9
+EMA_SLOW_LEN = 21
+ADX_LEN = 14
+ADX_MIN = 25.0
+ADX_MAX = 34.0
 
-ENCABEZADOS_BITACORA = [
-    "ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Duracion_Min", "Sesion",
-    "Ticker", "Direccion", "Entrada", "Salida_Prom_Ponderada", "SL_Inicial",
-    "Distancia_SL_%", "TP1", "TP2", "Lotaje", "Valor_Nocional",
-    "NATR_Mult", "ADX_Entr", "Resultado", "PnL_USDT", "Comision_USDT",
-    "PnL_Neto", "R_Multiple", "Balance_USD"
+# Archivos de Persistencia
+ESTADO_FILE = "estado_bot.json"
+CSV_FILE = "bitacora_dscalp.csv"
+XLSX_FILE = "Bitacora_DScalp_PRO.xlsx"
+
+CSV_COLUMNS = [
+    "UID",
+    "ID_Trade",
+    "Fecha_Entrada",
+    "Fecha_Salida",
+    "TS_Entrada_MS",
+    "TS_Salida_MS",
+    "Duracion_Min",
+    "Sesion",
+    "Ticker",
+    "Direccion",
+    "Entrada",
+    "Salida_Prom_Ponderada",
+    "SL_Inicial",
+    "Distancia_SL_%",
+    "TP1",
+    "TP2",
+    "Lotaje",
+    "Valor_Nocional",
+    "NATR_Mult",
+    "ADX_Entr",
+    "Resultado",
+    "PnL_USDT",
+    "Comision_USDT",
+    "PnL_Neto",
+    "R_Multiple",
+    "Balance_USD",
 ]
 
 
 # ==============================================================================
-# 2. MOTOR CONTABLE INMUTABLE Y RECONCILIACION CRONOLOGICA (.CSV + .XLSX)
+# 2. GESTIÓN DE ESTADO PERSISTENTE (IDEMPOTENCIA)
 # ==============================================================================
-def clasificar_sesion(hora_local):
-    if 8 <= hora_local < 13:
-        return "NY Open"
-    elif hora_local < 8:
-        return "Londres/Asia"
-    return "NY Tarde"
+def cargar_estado() -> dict:
+    default_state = {
+        "version": VERSION,
+        "motor": MOTOR_ID,
+        "ultimo_ts_evento": TS_INICIO_V39_MS,
+        "ultimo_update_id": 0,
+        "operar_finde": False,
+        "ultima_hora_reporte": "",
+        "ultimo_cierre_diario": "",
+        "ops_finde_pendientes": [],
+    }
+    if not os.path.exists(ESTADO_FILE):
+        return default_state
+    try:
+        with open(ESTADO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in default_state.items():
+            data.setdefault(k, v)
+        data["version"] = VERSION
+        data["motor"] = MOTOR_ID
+        data["ultimo_ts_evento"] = max(int(float(data.get("ultimo_ts_evento", 0))), TS_INICIO_V39_MS)
+        return data
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        print(f"[WARN] Error leyendo {ESTADO_FILE}: {exc}. Usando estado limpio.")
+        return default_state
 
 
-def asegurar_archivo_bitacora():
-    if os.path.exists(BITACORA_FILE):
+def guardar_estado(estado: dict) -> None:
+    estado["version"] = VERSION
+    estado["motor"] = MOTOR_ID
+    with open(ESTADO_FILE, "w", encoding="utf-8") as f:
+        json.dump(estado, f, indent=2, ensure_ascii=False)
+
+
+# ==============================================================================
+# 3. DESCARGA DE VELAS BITGET V2 E INDICADORES (PARIDAD EXACTA PINE SCRIPT)
+# ==============================================================================
+def descargar_velas_bitget(symbol: str, granularity: str, limit: int = 300) -> pd.DataFrame:
+    headers = {"User-Agent": USER_AGENT}
+    params = {
+        "symbol": symbol,
+        "productType": PRODUCT_TYPE,
+        "granularity": granularity,
+        "limit": str(limit),
+    }
+    for intento in range(3):
         try:
-            df_check = pd.read_csv(BITACORA_FILE)
-            if list(df_check.columns) == ENCABEZADOS_BITACORA:
-                return True
-        except Exception:
-            pass
-    with open(BITACORA_FILE, mode="w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(ENCABEZADOS_BITACORA)
-    return False
+            resp = requests.get(BITGET_CANDLES_URL, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                time.sleep(1.5 * (intento + 1))
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("code") != "00000" or not payload.get("data"):
+                return pd.DataFrame()
+            raw = payload["data"]
+            df = pd.DataFrame(
+                raw,
+                columns=["ts", "open", "high", "low", "close", "vol_base", "vol_quote"],
+            )
+            df["ts"] = df["ts"].astype("int64")
+            for col in ["open", "high", "low", "close", "vol_base"]:
+                df[col] = df[col].astype(float)
+            df = df.sort_values("ts").drop_duplicates("ts").reset_index(drop=True)
+            return df
+        except requests.RequestException as exc:
+            print(f"[WARN] Bitget HTTP {symbol} ({granularity}) intento {intento+1}: {exc}")
+            time.sleep(1.0)
+    return pd.DataFrame()
 
 
-def contar_trades_bitacora():
-    asegurar_archivo_bitacora()
-    try:
-        return len(pd.read_csv(BITACORA_FILE))
-    except Exception:
-        return 0
+def pine_ema(series: pd.Series, length: int) -> pd.Series:
+    """Réplica exacta de ta.ema() de Pine Script ignorando NaN iniciales."""
+    vals = series.tolist()
+    n = len(vals)
+    out = [math.nan] * n
+    alpha = 2.0 / (length + 1.0)
+    valid_buf = []
+    prev = math.nan
+    for i, v in enumerate(vals):
+        if v is None or math.isnan(v):
+            continue
+        if math.isnan(prev):
+            valid_buf.append(v)
+            if len(valid_buf) == length:
+                prev = sum(valid_buf) / length
+                out[i] = prev
+        else:
+            prev = alpha * v + (1.0 - alpha) * prev
+            out[i] = prev
+    return pd.Series(out, index=series.index)
 
 
-def filtrar_por_circuit_breaker_diario(trades_detectados):
-    """
-    Ordena cronologicamente las operaciones de cada dia y descarta aquellas cuya
-    entrada haya ocurrido DESPUES de que la cuenta ya hubiera acumulado MAX_SL_GLOBAL_DIA (3) SL en ese mismo dia.
-    """
-    if not trades_detectados:
+def pine_rma(series: pd.Series, length: int) -> pd.Series:
+    """Réplica exacta de ta.rma() de Pine Script iniciando SMA en primeros valores no-NaN."""
+    vals = series.tolist()
+    n = len(vals)
+    out = [math.nan] * n
+    alpha = 1.0 / length
+    valid_buf = []
+    prev = math.nan
+    for i, v in enumerate(vals):
+        if v is None or math.isnan(v):
+            continue
+        if math.isnan(prev):
+            valid_buf.append(v)
+            if len(valid_buf) == length:
+                prev = sum(valid_buf) / length
+                out[i] = prev
+        else:
+            prev = alpha * v + (1.0 - alpha) * prev
+            out[i] = prev
+    return pd.Series(out, index=series.index)
+
+
+def calcular_atr_adx(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    """Réplica exacta de ta.atr(length) y ta.dmi(length, length) en Pine Script v6."""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm_vals = []
+    minus_dm_vals = []
+    for u, d in zip(up_move.tolist(), down_move.tolist()):
+        if math.isnan(u) or math.isnan(d):
+            plus_dm_vals.append(math.nan)
+            minus_dm_vals.append(math.nan)
+        else:
+            plus_dm_vals.append(u if (u > d and u > 0.0) else 0.0)
+            minus_dm_vals.append(d if (d > u and d > 0.0) else 0.0)
+
+    plus_dm = pd.Series(plus_dm_vals, index=df.index)
+    minus_dm = pd.Series(minus_dm_vals, index=df.index)
+
+    atr = pine_rma(tr, length)
+    sm_plus = pine_rma(plus_dm, length)
+    sm_minus = pine_rma(minus_dm, length)
+
+    di_plus = (100.0 * (sm_plus / atr.replace(0.0, math.nan))).ffill()
+    di_minus = (100.0 * (sm_minus / atr.replace(0.0, math.nan))).ffill()
+    di_sum = (di_plus + di_minus).replace(0.0, 1.0)
+    dx = 100.0 * ((di_plus - di_minus).abs() / di_sum)
+    adx = pine_rma(dx, length)
+
+    df["atr"] = atr
+    df["adx"] = adx
+    return df
+
+
+def calcular_vwap_utc(df: pd.DataFrame) -> pd.Series:
+    dt_utc = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    dia_utc = dt_utc.dt.date
+    hlc3 = (df["high"] + df["low"] + df["close"]) / 3.0
+    pv = hlc3 * df["vol_base"]
+    cum_pv = pv.groupby(dia_utc).cumsum()
+    cum_vol = df["vol_base"].groupby(dia_utc).cumsum().replace(0.0, math.nan)
+    return cum_pv / cum_vol
+
+
+def obtener_serie_trend_mtf(df_mtf: pd.DataFrame, tf_ms: int) -> list:
+    if df_mtf.empty:
         return []
-    ordenados = sorted(trades_detectados, key=lambda x: (x["ts_entrada"], x["ts_salida"]))
-    sl_corte_por_dia = {}
+    ema9 = pine_ema(df_mtf["close"], EMA_FAST_LEN)
+    ema21 = pine_ema(df_mtf["close"], EMA_SLOW_LEN)
+    trends = []
+    for i in range(len(df_mtf)):
+        if math.isnan(ema9.iloc[i]) or math.isnan(ema21.iloc[i]):
+            t = 0
+        elif ema9.iloc[i] > ema21.iloc[i]:
+            t = 1
+        elif ema9.iloc[i] < ema21.iloc[i]:
+            t = -1
+        else:
+            t = 0
+        close_ts = int(df_mtf["ts"].iloc[i]) + tf_ms
+        trends.append((close_ts, t))
+    return trends
 
-    # Identificar a que hora exacta (ts_salida) se alcanzo el 3er SL de cada dia
-    sl_por_dia = {}
-    for tr in sorted(trades_detectados, key=lambda x: x["ts_salida"]):
-        if tr["resultado"] == "SL":
-            dia_sal = datetime.fromtimestamp(int(tr["ts_salida"]) / 1000.0, tz=TZ_UTC4).date()
-            sl_por_dia.setdefault(dia_sal, []).append(int(tr["ts_salida"]))
-            if len(sl_por_dia[dia_sal]) == MAX_SL_GLOBAL_DIA:
-                sl_corte_por_dia[dia_sal] = int(tr["ts_salida"])
 
-    filtrados = []
-    for tr in ordenados:
-        dia_ent = datetime.fromtimestamp(int(tr["ts_entrada"]) / 1000.0, tz=TZ_UTC4).date()
-        ts_corte = sl_corte_por_dia.get(dia_ent)
-        if ts_corte is not None and int(tr["ts_entrada"]) > ts_corte:
+def buscar_trend_confirmado(trends_list: list, candle_5m_open_ts: int) -> int:
+    # Paridad 1:1 con request.security(..., tf, f_trend_mtf()[1], lookahead_on)
+    last_t = 0
+    for close_ts, t in trends_list:
+        if close_ts <= candle_5m_open_ts:
+            last_t = t
+        else:
+            break
+    return last_t
+
+
+def obtener_natr_mult(natr_pct: float) -> float:
+    if natr_pct < 0.25:
+        return 1.50
+    if natr_pct < 0.45:
+        return 1.65
+    if natr_pct < 0.70:
+        return 1.78
+    if natr_pct < 1.00:
+        return 2.00
+    return 2.25
+
+
+def formatear_precio(symbol: str, val: float) -> str:
+    if symbol in ("XRPUSDT", "ADAUSDT", "SUIUSDT"):
+        return f"{val:.4f}"
+    if symbol in ("XAGUSDT", "SOLUSDT", "BNBUSDT", "ZECUSDT"):
+        return f"{val:.2f}"
+    return f"{val:.1f}"
+
+
+# ==============================================================================
+# 4. SIMULACIÓN DETERMINISTA POR ACTIVO (VELAS CERRADAS 5m)
+# ==============================================================================
+def simular_activo(symbol: str, operar_finde: bool) -> dict:
+    df5 = descargar_velas_bitget(symbol, "5m", limit=350)
+    df15 = descargar_velas_bitget(symbol, "15m", limit=150)
+    df30 = descargar_velas_bitget(symbol, "30m", limit=100)
+
+    if df5.empty or len(df5) < 60 or df15.empty or df30.empty:
+        print(f"[WARN] Datos incompletos Bitget para {symbol} (5m={len(df5)}, 15m={len(df15)}, 30m={len(df30)}).")
+        return {"symbol": symbol, "cerrados": [], "en_op": None, "eventos": [], "hud": {}}
+
+    # Descartar la última vela en formación (solo procesar velas confirmadas)
+    now_ms = int(time.time() * 1000)
+    df5 = df5[df5["ts"] + 300_000 <= now_ms].reset_index(drop=True)
+    df15 = df15[df15["ts"] + 900_000 <= now_ms].reset_index(drop=True)
+    df30 = df30[df30["ts"] + 1_800_000 <= now_ms].reset_index(drop=True)
+
+    if len(df5) < 40:
+        return {"symbol": symbol, "cerrados": [], "en_op": None, "eventos": [], "hud": {}}
+
+    df5["ema9"] = pine_ema(df5["close"], EMA_FAST_LEN)
+    df5["ema21"] = pine_ema(df5["close"], EMA_SLOW_LEN)
+    df5 = calcular_atr_adx(df5, ADX_LEN)
+    df5["vwap"] = calcular_vwap_utc(df5)
+
+    trends_15 = obtener_serie_trend_mtf(df15, 900_000)
+    trends_30 = obtener_serie_trend_mtf(df30, 1_800_000)
+
+    piso_sl_pct = 0.0020 if "XAUT" in symbol else 0.0025
+
+    pos_dir = 0
+    entry_price = 0.0
+    sl_inicial = 0.0
+    sl_actual = 0.0
+    tp1_price = 0.0
+    tp2_price = 0.0
+    tp1_hit = False
+    lotaje_op = 0.0
+    natr_mult_op = 1.50
+    adx_entr_op = 0.0
+    ts_entrada_ms = 0
+
+    cooldown_cnt = 0
+    sl_hoy_par = 0
+    dia_actual = None
+
+    cerrados = []
+    eventos = []
+    hud_info = {}
+
+    for i in range(30, len(df5)):
+        row = df5.iloc[i]
+        prev_row = df5.iloc[i - 1]
+        ts_open = int(row["ts"])
+        ts_close = ts_open + 300_000
+
+        # Paridad Pine Script: hour(time, "UTC-4") usa el timestamp de APERTURA de la vela (ts_open)
+        dt_open_u4 = datetime.fromtimestamp(ts_open / 1000.0, tz=TZ_UTC4)
+        dia_str = dt_open_u4.strftime("%Y-%m-%d")
+        if dia_actual != dia_str:
+            dia_actual = dia_str
+            sl_hoy_par = 0
+
+        if cooldown_cnt > 0:
+            cooldown_cnt -= 1
+
+        c_high = float(row["high"])
+        c_low = float(row["low"])
+        c_close = float(row["close"])
+        ema9 = float(row["ema9"])
+        ema21 = float(row["ema21"])
+        prev_ema9 = float(prev_row["ema9"])
+        prev_ema21 = float(prev_row["ema21"])
+        atr_val = float(row["atr"])
+        adx_val = float(row["adx"])
+        vwap_val = float(row["vwap"])
+
+        if any(math.isnan(x) for x in [ema9, ema21, prev_ema9, prev_ema21, atr_val, adx_val, vwap_val]):
             continue
-        filtrados.append(tr)
-    return filtrados
+
+        natr_pct = (atr_val / c_close) * 100.0
+        natr_mult = obtener_natr_mult(natr_pct)
+        t15 = buscar_trend_confirmado(trends_15, ts_open)
+        t30 = buscar_trend_confirmado(trends_30, ts_open)
+
+        hora_u4 = dt_open_u4.hour
+        es_finde = dt_open_u4.weekday() >= 5
+        en_horario = (HORA_INICIO <= hora_u4 < HORA_FIN) and (operar_finde or not es_finde)
+
+        # 1. Gestión de posición abierta
+        if pos_dir == 1:
+            if c_low <= sl_actual:
+                uid = f"{symbol}_{ts_entrada_ms}"
+                if tp1_hit:
+                    pnl_bruto = round(RIESGO_USD * (TP1_MULT * 0.5), 2)
+                    salida_prom = round((tp1_price + entry_price) / 2.0, 6)
+                    resultado = "TP1+BE"
+                    ev_txt = "🛡️ STOP EN BREAK-EVEN (Tras TP1)"
+                else:
+                    pnl_bruto = round(-RIESGO_USD, 2)
+                    salida_prom = round(sl_actual, 6)
+                    resultado = "SL"
+                    sl_hoy_par += 1
+                    ev_txt = "🛑 STOP LOSS ALCANZADO"
+
+                cerrados.append(
+                    construir_registro_trade(
+                        uid, symbol, "LONG", ts_entrada_ms, ts_close,
+                        entry_price, salida_prom, sl_inicial, tp1_price, tp2_price,
+                        lotaje_op, natr_mult_op, adx_entr_op, resultado, pnl_bruto
+                    )
+                )
+                eventos.append({
+                    "uid": uid,
+                    "ts_evento": ts_close,
+                    "symbol": symbol,
+                    "tipo": resultado,
+                    "evento_txt": ev_txt,
+                    "entrada": entry_price,
+                    "salida": sl_actual,
+                    "pnl_bruto": pnl_bruto,
+                })
+                pos_dir = 0
+                cooldown_cnt = COOLDOWN_VELAS
+            else:
+                if not tp1_hit and c_high >= tp1_price:
+                    tp1_hit = True
+                    sl_actual = entry_price
+                    uid = f"{symbol}_{ts_entrada_ms}"
+                    eventos.append({
+                        "uid": uid,
+                        "ts_evento": ts_close,
+                        "symbol": symbol,
+                        "tipo": "TP1",
+                        "evento_txt": "🎯 TAKE PROFIT 1 (SL a BE)",
+                        "entrada": entry_price,
+                        "salida": tp1_price,
+                        "pnl_bruto": round(RIESGO_USD * (TP1_MULT * 0.5), 2),
+                    })
+                if c_high >= tp2_price:
+                    uid = f"{symbol}_{ts_entrada_ms}"
+                    pnl_bruto = round(RIESGO_USD * ((TP1_MULT + TP2_MULT) * 0.5), 2)
+                    salida_prom = round((tp1_price + tp2_price) / 2.0, 6)
+                    cerrados.append(
+                        construir_registro_trade(
+                            uid, symbol, "LONG", ts_entrada_ms, ts_close,
+                            entry_price, salida_prom, sl_inicial, tp1_price, tp2_price,
+                            lotaje_op, natr_mult_op, adx_entr_op, "TP2", pnl_bruto
+                        )
+                    )
+                    eventos.append({
+                        "uid": uid,
+                        "ts_evento": ts_close,
+                        "symbol": symbol,
+                        "tipo": "TP2",
+                        "evento_txt": "🏆 TAKE PROFIT 2 (Objetivo Final)",
+                        "entrada": entry_price,
+                        "salida": tp2_price,
+                        "pnl_bruto": pnl_bruto,
+                    })
+                    pos_dir = 0
+                    cooldown_cnt = COOLDOWN_VELAS
+
+        elif pos_dir == -1:
+            if c_high >= sl_actual:
+                uid = f"{symbol}_{ts_entrada_ms}"
+                if tp1_hit:
+                    pnl_bruto = round(RIESGO_USD * (TP1_MULT * 0.5), 2)
+                    salida_prom = round((tp1_price + entry_price) / 2.0, 6)
+                    resultado = "TP1+BE"
+                    ev_txt = "🛡️ STOP EN BREAK-EVEN (Tras TP1)"
+                else:
+                    pnl_bruto = round(-RIESGO_USD, 2)
+                    salida_prom = round(sl_actual, 6)
+                    resultado = "SL"
+                    sl_hoy_par += 1
+                    ev_txt = "🛑 STOP LOSS ALCANZADO"
+
+                cerrados.append(
+                    construir_registro_trade(
+                        uid, symbol, "SHORT", ts_entrada_ms, ts_close,
+                        entry_price, salida_prom, sl_inicial, tp1_price, tp2_price,
+                        lotaje_op, natr_mult_op, adx_entr_op, resultado, pnl_bruto
+                    )
+                )
+                eventos.append({
+                    "uid": uid,
+                    "ts_evento": ts_close,
+                    "symbol": symbol,
+                    "tipo": resultado,
+                    "evento_txt": ev_txt,
+                    "entrada": entry_price,
+                    "salida": sl_actual,
+                    "pnl_bruto": pnl_bruto,
+                })
+                pos_dir = 0
+                cooldown_cnt = COOLDOWN_VELAS
+            else:
+                if not tp1_hit and c_low <= tp1_price:
+                    tp1_hit = True
+                    sl_actual = entry_price
+                    uid = f"{symbol}_{ts_entrada_ms}"
+                    eventos.append({
+                        "uid": uid,
+                        "ts_evento": ts_close,
+                        "symbol": symbol,
+                        "tipo": "TP1",
+                        "evento_txt": "🎯 TAKE PROFIT 1 (SL a BE)",
+                        "entrada": entry_price,
+                        "salida": tp1_price,
+                        "pnl_bruto": round(RIESGO_USD * (TP1_MULT * 0.5), 2),
+                    })
+                if c_low <= tp2_price:
+                    uid = f"{symbol}_{ts_entrada_ms}"
+                    pnl_bruto = round(RIESGO_USD * ((TP1_MULT + TP2_MULT) * 0.5), 2)
+                    salida_prom = round((tp1_price + tp2_price) / 2.0, 6)
+                    cerrados.append(
+                        construir_registro_trade(
+                            uid, symbol, "SHORT", ts_entrada_ms, ts_close,
+                            entry_price, salida_prom, sl_inicial, tp1_price, tp2_price,
+                            lotaje_op, natr_mult_op, adx_entr_op, "TP2", pnl_bruto
+                        )
+                    )
+                    eventos.append({
+                        "uid": uid,
+                        "ts_evento": ts_close,
+                        "symbol": symbol,
+                        "tipo": "TP2",
+                        "evento_txt": "🏆 TAKE PROFIT 2 (Objetivo Final)",
+                        "entrada": entry_price,
+                        "salida": tp2_price,
+                        "pnl_bruto": pnl_bruto,
+                    })
+                    pos_dir = 0
+                    cooldown_cnt = COOLDOWN_VELAS
+
+        # 2. Evaluación de nueva entrada (solo a partir del arranque limpio TS_INICIO_V39_MS)
+        adx_ok = ADX_MIN <= adx_val <= ADX_MAX
+        puede_entrar = (
+            ts_open >= TS_INICIO_V39_MS
+            and pos_dir == 0
+            and cooldown_cnt == 0
+            and en_horario
+            and sl_hoy_par < MAX_DERROTAS_PAR_DIA
+            and adx_ok
+        )
+        cruce_alcista = prev_ema9 <= prev_ema21 and ema9 > ema21
+        cruce_bajista = prev_ema9 >= prev_ema21 and ema9 < ema21
+
+        dist_sl_din = max(atr_val * natr_mult, c_close * piso_sl_pct)
+
+        if puede_entrar and cruce_alcista and c_close > vwap_val and t15 == 1 and t30 == 1:
+            pos_dir = 1
+            entry_price = c_close
+            sl_inicial = c_close - dist_sl_din
+            sl_actual = sl_inicial
+            tp1_price = c_close + dist_sl_din * TP1_MULT
+            tp2_price = c_close + dist_sl_din * TP2_MULT
+            tp1_hit = False
+            lotaje_op = RIESGO_USD / dist_sl_din
+            natr_mult_op = natr_mult
+            adx_entr_op = round(adx_val, 1)
+            ts_entrada_ms = ts_open
+
+            uid = f"{symbol}_{ts_entrada_ms}"
+            eventos.append({
+                "uid": uid,
+                "ts_evento": ts_close,
+                "symbol": symbol,
+                "tipo": "ENTRY",
+                "evento_txt": f"🟢 NUEVA SEÑAL LONG | SL: {formatear_precio(symbol, sl_inicial)} | TP1: {formatear_precio(symbol, tp1_price)} | TP2: {formatear_precio(symbol, tp2_price)}",
+                "entrada": entry_price,
+                "salida": entry_price,
+                "pnl_bruto": 0.0,
+            })
+
+        elif puede_entrar and cruce_bajista and c_close < vwap_val and t15 == -1 and t30 == -1:
+            pos_dir = -1
+            entry_price = c_close
+            sl_inicial = c_close + dist_sl_din
+            sl_actual = sl_inicial
+            tp1_price = c_close - dist_sl_din * TP1_MULT
+            tp2_price = c_close - dist_sl_din * TP2_MULT
+            tp1_hit = False
+            lotaje_op = RIESGO_USD / dist_sl_din
+            natr_mult_op = natr_mult
+            adx_entr_op = round(adx_val, 1)
+            ts_entrada_ms = ts_open
+
+            uid = f"{symbol}_{ts_entrada_ms}"
+            eventos.append({
+                "uid": uid,
+                "ts_evento": ts_close,
+                "symbol": symbol,
+                "tipo": "ENTRY",
+                "evento_txt": f"🔴 NUEVA SEÑAL SHORT | SL: {formatear_precio(symbol, sl_inicial)} | TP1: {formatear_precio(symbol, tp1_price)} | TP2: {formatear_precio(symbol, tp2_price)}",
+                "entrada": entry_price,
+                "salida": entry_price,
+                "pnl_bruto": 0.0,
+            })
+
+        # Actualizar HUD de la última vela confirmada
+        hud_info = {
+            "symbol": symbol,
+            "precio": c_close,
+            "natr_mult": natr_mult,
+            "pos_dir": pos_dir,
+            "entry_price": entry_price,
+            "tp1_hit": tp1_hit,
+            "en_horario": en_horario,
+            "es_finde": es_finde,
+        }
+
+    en_op = None
+    if pos_dir != 0:
+        en_op = {
+            "uid": f"{symbol}_{ts_entrada_ms}",
+            "symbol": symbol,
+            "direccion": "LONG" if pos_dir == 1 else "SHORT",
+            "ts_entrada_ms": ts_entrada_ms,
+            "entrada": entry_price,
+            "tp1_hit": tp1_hit,
+        }
+
+    return {
+        "symbol": symbol,
+        "cerrados": cerrados,
+        "en_op": en_op,
+        "eventos": eventos,
+        "hud": hud_info,
+    }
 
 
-def sincronizar_bitacora_completa(trades_detectados, estado):
-    asegurar_archivo_bitacora()
-    trades_validos = filtrar_por_circuit_breaker_diario(trades_detectados)
+def construir_registro_trade(
+    uid: str,
+    symbol: str,
+    direccion: str,
+    ts_in: int,
+    ts_out: int,
+    entrada: float,
+    salida_prom: float,
+    sl_ini: float,
+    tp1: float,
+    tp2: float,
+    lotaje: float,
+    natr_mult: float,
+    adx_entr: float,
+    resultado: str,
+    pnl_bruto: float,
+) -> dict:
+    dt_in = datetime.fromtimestamp(ts_in / 1000.0, tz=TZ_UTC4)
+    dt_out = datetime.fromtimestamp(ts_out / 1000.0, tz=TZ_UTC4)
+    dur_min = max(5, int((ts_out - ts_in) // 60_000))
+    sesion = "NY Open" if dt_in.hour < 13 else "NY Tarde"
+    dist_sl_pct = round(abs(entrada - sl_ini) / entrada, 5)
+    valor_nocional = round(lotaje * entrada, 2)
+    comision = round(valor_nocional * COMISION_RT, 2)
+    pnl_neto = round(pnl_bruto - comision, 2)
+    r_mult = round(pnl_neto / RIESGO_USD, 2)
 
+    return {
+        "UID": uid,
+        "ID_Trade": "",
+        "Fecha_Entrada": dt_in.strftime("%d/%m %H:%M"),
+        "Fecha_Salida": dt_out.strftime("%d/%m %H:%M"),
+        "TS_Entrada_MS": int(ts_in),
+        "TS_Salida_MS": int(ts_out),
+        "Duracion_Min": dur_min,
+        "Sesion": sesion,
+        "Ticker": symbol,
+        "Direccion": direccion,
+        "Entrada": round(entrada, 6),
+        "Salida_Prom_Ponderada": round(salida_prom, 6),
+        "SL_Inicial": round(sl_ini, 6),
+        "Distancia_SL_%": dist_sl_pct,
+        "TP1": round(tp1, 6),
+        "TP2": round(tp2, 6),
+        "Lotaje": round(lotaje, 3),
+        "Valor_Nocional": valor_nocional,
+        "NATR_Mult": round(natr_mult, 2),
+        "ADX_Entr": round(adx_entr, 1),
+        "Resultado": resultado,
+        "PnL_USDT": round(pnl_bruto, 2),
+        "Comision_USDT": comision,
+        "PnL_Neto": pnl_neto,
+        "R_Multiple": r_mult,
+        "Balance_USD": 0.0,
+    }
+
+
+# ==============================================================================
+# 5. MOTOR DE CARTERA V3.9 (LÍNEA TEMPORAL CAUSAL UNIFICADA)
+# ==============================================================================
+def cargar_csv_historico() -> pd.DataFrame:
+    if not os.path.exists(CSV_FILE):
+        return pd.DataFrame(columns=CSV_COLUMNS)
     try:
-        df_exist = pd.read_csv(BITACORA_FILE)
-    except Exception:
-        df_exist = pd.DataFrame(columns=ENCABEZADOS_BITACORA)
+        df = pd.read_csv(CSV_FILE)
+        for col in CSV_COLUMNS:
+            if col not in df.columns:
+                df[col] = 0 if "TS_" in col else ""
+        return df[CSV_COLUMNS].copy()
+    except Exception as exc:
+        print(f"[WARN] Error leyendo {CSV_FILE}: {exc}")
+        return pd.DataFrame(columns=CSV_COLUMNS)
 
-    anio_actual = datetime.now(TZ_UTC4).year
-    trades_reg = set(estado.get("trades_registrados", []))
-    claves_csv = set()
-    intervalos_por_ticker = {}
 
-    if not df_exist.empty:
-        for _, r in df_exist.iterrows():
-            tk_ex = str(r["Ticker"]).strip()
-            fe_ex = str(r["Fecha_Entrada"]).strip()
-            fs_ex = str(r["Fecha_Salida"]).strip()
-            claves_csv.add((tk_ex, fe_ex))
-            try:
-                dt_e_ex = datetime.strptime(f"{fe_ex}/{anio_actual}", "%d/%m %H:%M/%Y").replace(tzinfo=TZ_UTC4)
-                dt_s_ex = datetime.strptime(f"{fs_ex}/{anio_actual}", "%d/%m %H:%M/%Y").replace(tzinfo=TZ_UTC4)
-                intervalos_por_ticker.setdefault(tk_ex, []).append((dt_e_ex, dt_s_ex))
-            except Exception:
-                pass
+def aplicar_filtros_cartera(
+    df_hist: pd.DataFrame,
+    nuevos_cerrados: list,
+    ops_abiertas: list,
+) -> tuple:
+    """
+    Motor causal unificado V3.9:
+    Procesa cerrados + abiertos en UNA SOLA línea de tiempo cronológica (ts_entrada, prioridad SYMBOLS)
+    para que un trade abierto nunca sea desplazado ni cause reescrituras retroactivas al cerrarse:
+      1. Verifica cupo simultáneo real (MAX_POSICIONES_SIMULTANEAS = 2).
+      2. Verifica Circuit Breaker diario (MAX_SL_GLOBAL_DIA = 3 SL ya cerrados hasta ts_entrada).
+      3. Verifica límite por par/día (MAX_DERROTAS_PAR_DIA = 2 SL reales aceptados).
+    """
+    prio_map = {sym: idx for idx, sym in enumerate(SYMBOLS)}
+    cerrados_map = {}
 
-    filas_nuevas = []
-    for tr in trades_validos:
-        dt_ent = datetime.fromtimestamp(int(tr["ts_entrada"]) / 1000.0, tz=TZ_UTC4)
-        dt_sal = datetime.fromtimestamp(int(tr["ts_salida"]) / 1000.0, tz=TZ_UTC4)
-        f_ent = dt_ent.strftime("%d/%m %H:%M")
-        f_sal = dt_sal.strftime("%d/%m %H:%M")
-        tk_actual = str(tr["ticker"]).strip()
-        clave_unica = (tk_actual, f_ent)
+    if not df_hist.empty:
+        for _, r in df_hist.iterrows():
+            uid = str(r["UID"]).strip()
+            if uid and uid.lower() != "nan":
+                cerrados_map[uid] = r.to_dict()
 
-        if clave_unica in claves_csv:
-            trades_reg.add(tr["uid"])
-            continue
+    for t in nuevos_cerrados:
+        uid = str(t["UID"]).strip()
+        if uid and uid not in cerrados_map:
+            cerrados_map[uid] = t
 
-        # Bloqueo anti-solapamiento: evita registrar trades fantasma si ya existe una operacion activa en ese rango horario
-        solapado = False
-        for int_e, int_s in intervalos_por_ticker.get(tk_actual, []):
-            if dt_ent < int_s and dt_sal > int_e:
-                solapado = True
-                break
-        if solapado:
-            trades_reg.add(tr["uid"])
-            continue
-
-        duracion_min = max(1, int(round((int(tr["ts_salida"]) - int(tr["ts_entrada"])) / 60000.0)))
-        sesion = clasificar_sesion(dt_ent.hour)
-        p_ent = float(tr["precio_entrada"])
-        p_sal_prom = float(tr["precio_salida_prom"])
-        sl_ini = float(tr["sl_inicial"])
-        tp1 = float(tr["tp1"])
-        tp2 = float(tr["tp2"])
-        lotaje = float(tr["lotaje"])
-
-        dist_sl_pct = abs(p_ent - sl_ini) / p_ent if p_ent > 0 else 0.0
-        valor_nocional = p_ent * lotaje
-        comision_usdt = (p_ent * lotaje + p_sal_prom * lotaje) * TAKER_FEE
-        pnl_bruto = float(tr["pnl_bruto"])
-        pnl_neto = pnl_bruto - comision_usdt
-        # R_Multiple Neto Real (incluyendo comisiones) para que la Expectativa sea 100% real
-        r_mult_neto = pnl_neto / RIESGO_USD if RIESGO_USD > 0 else float(tr["r_mult"])
-        dec = 4 if p_ent < 10.0 else (1 if p_ent >= 1000.0 else 2)
-
-        filas_nuevas.append({
-            "ID_Trade": "#000",
-            "Fecha_Entrada": f_ent,
-            "Fecha_Salida": f_sal,
-            "Duracion_Min": duracion_min,
-            "Sesion": sesion,
-            "Ticker": tr["ticker"],
-            "Direccion": tr["direccion"],
-            "Entrada": round(p_ent, dec),
-            "Salida_Prom_Ponderada": round(p_sal_prom, dec),
-            "SL_Inicial": round(sl_ini, dec),
-            "Distancia_SL_%": round(dist_sl_pct, 5),
-            "TP1": round(tp1, dec),
-            "TP2": round(tp2, dec),
-            "Lotaje": round(lotaje, 3),
-            "Valor_Nocional": round(valor_nocional, 2),
-            "NATR_Mult": round(float(tr["natr_mult"]), 2),
-            "ADX_Entr": round(float(tr["adx_entrada"]), 1),
-            "Resultado": tr["resultado"],
-            "PnL_USDT": round(pnl_bruto, 2),
-            "Comision_USDT": round(comision_usdt, 2),
-            "PnL_Neto": round(pnl_neto, 2),
-            "R_Multiple": round(r_mult_neto, 2),
-            "Balance_USD": 0.0
+    candidatos = []
+    for t in cerrados_map.values():
+        candidatos.append({
+            "kind": "closed",
+            "uid": str(t["UID"]),
+            "symbol": str(t["Ticker"]),
+            "ts_in": int(float(t["TS_Entrada_MS"])),
+            "ts_out": int(float(t["TS_Salida_MS"])),
+            "is_sl": str(t["Resultado"]) == "SL",
+            "payload": t,
         })
-        claves_csv.add(clave_unica)
-        intervalos_por_ticker.setdefault(tk_actual, []).append((dt_ent, dt_sal))
-        trades_reg.add(tr["uid"])
 
-    if not filas_nuevas and not df_exist.empty:
-        bal_actual = round(float(df_exist["Balance_USD"].iloc[-1]), 2)
-        estado["capital_acumulado"] = bal_actual
-        estado["trades_registrados"] = list(trades_reg)
-        return bal_actual, False
+    for op in ops_abiertas:
+        uid = str(op["uid"])
+        if uid not in cerrados_map:
+            candidatos.append({
+                "kind": "open",
+                "uid": uid,
+                "symbol": str(op["symbol"]),
+                "ts_in": int(float(op["ts_entrada_ms"])),
+                "ts_out": math.inf,
+                "is_sl": False,
+                "payload": op,
+            })
 
-    df_total = pd.concat([df_exist, pd.DataFrame(filas_nuevas)], ignore_index=True) if not df_exist.empty else pd.DataFrame(filas_nuevas)
-    if df_total.empty:
-        estado["capital_acumulado"] = CAPITAL_INICIAL
-        estado["trades_registrados"] = list(trades_reg)
-        return CAPITAL_INICIAL, False
+    candidatos.sort(key=lambda x: (x["ts_in"], prio_map.get(x["symbol"], 99)))
 
-    df_total["_dt_sal"] = pd.to_datetime(df_total["Fecha_Salida"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
-    df_total["_dt_ent"] = pd.to_datetime(df_total["Fecha_Entrada"].astype(str) + f"/{anio_actual}", format="%d/%m %H:%M/%Y", errors="coerce")
-    df_total = df_total.sort_values(["_dt_sal", "_dt_ent", "Ticker"]).drop(columns=["_dt_sal", "_dt_ent"]).reset_index(drop=True)
+    aceptados = []
+    for cand in candidatos:
+        ts_in = cand["ts_in"]
+        dia_in = datetime.fromtimestamp(ts_in / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d")
 
-    bal = CAPITAL_INICIAL
-    nuevos_ids, nuevos_balances = [], []
-    for idx, row in df_total.iterrows():
-        nuevos_ids.append(f"#{idx + 1:03d}")
-        bal = round(bal + float(row["PnL_Neto"]), 2)
-        nuevos_balances.append(bal)
+        # 1. Posiciones ya aceptadas que siguen abiertas en ts_in
+        vivas_en_ts_in = sum(1 for a in aceptados if a["ts_out"] > ts_in)
+        if vivas_en_ts_in >= MAX_POSICIONES_SIMULTANEAS:
+            continue
 
-    df_total["ID_Trade"] = nuevos_ids
-    df_total["Balance_USD"] = nuevos_balances
-    df_total[ENCABEZADOS_BITACORA].to_csv(BITACORA_FILE, index=False, encoding="utf-8")
+        # 2. Circuit Breaker global: SL ya cerrados en ese mismo día antes o en ts_in
+        sl_global_hasta_ts_in = sum(
+            1 for a in aceptados
+            if a["is_sl"]
+            and a["ts_out"] <= ts_in
+            and datetime.fromtimestamp(a["ts_out"] / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d") == dia_in
+        )
+        if sl_global_hasta_ts_in >= MAX_SL_GLOBAL_DIA:
+            continue
 
-    estado["capital_acumulado"] = bal
-    estado["trades_registrados"] = list(trades_reg)
-    return bal, True
+        # 3. Límite por par/día sobre SL realmente aceptados
+        sl_par_hasta_ts_in = sum(
+            1 for a in aceptados
+            if a["is_sl"]
+            and a["symbol"] == cand["symbol"]
+            and a["ts_out"] <= ts_in
+            and datetime.fromtimestamp(a["ts_out"] / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d") == dia_in
+        )
+        if sl_par_hasta_ts_in >= MAX_DERROTAS_PAR_DIA:
+            continue
+
+        aceptados.append(cand)
+
+    validos_cerrados = [a["payload"] for a in aceptados if a["kind"] == "closed"]
+    abiertos_validos = [a["payload"] for a in aceptados if a["kind"] == "open"]
+    uids_validos = {a["uid"] for a in aceptados}
+
+    validos_cerrados.sort(key=lambda x: (int(float(x["TS_Salida_MS"])), int(float(x["TS_Entrada_MS"]))))
+
+    # Recalcular ID_Trade y Balance_USD secuencial
+    balance = CAPITAL_INICIAL
+    for idx, t in enumerate(validos_cerrados, start=1):
+        t["ID_Trade"] = f"#{idx:03d}"
+        balance = round(balance + float(t["PnL_Neto"]), 2)
+        t["Balance_USD"] = balance
+
+    df_final = (
+        pd.DataFrame(validos_cerrados, columns=CSV_COLUMNS)
+        if validos_cerrados
+        else pd.DataFrame(columns=CSV_COLUMNS)
+    )
+
+    hoy_str = datetime.now(TZ_UTC4).strftime("%Y-%m-%d")
+    sl_hoy_global = sum(
+        1 for t in validos_cerrados
+        if str(t["Resultado"]) == "SL"
+        and datetime.fromtimestamp(int(float(t["TS_Salida_MS"])) / 1000.0, tz=TZ_UTC4).strftime("%Y-%m-%d") == hoy_str
+    )
+    freno_activo_hoy = sl_hoy_global >= MAX_SL_GLOBAL_DIA
+
+    return df_final, uids_validos, abiertos_validos, freno_activo_hoy, sl_hoy_global
 
 
-def generar_excel_profesional():
-    asegurar_archivo_bitacora()
-    df = pd.read_csv(BITACORA_FILE)
-
+# ==============================================================================
+# 6. GENERACIÓN DE BITÁCORA EXCEL CUANTITATIVA (Bitacora_DScalp_PRO.xlsx)
+# ==============================================================================
+def generar_excel_bitacora(df: pd.DataFrame) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Bitacora_DScalp"
-    ws.views.sheetView[0].showGridLines = True
 
-    fill_header_kpi = PatternFill("solid", fgColor="111827")
-    fill_kpi_box = PatternFill("solid", fgColor="1F2937")
-    fill_th = PatternFill("solid", fgColor="0F172A")
-    fill_tp2 = PatternFill("solid", fgColor="D1FAE5")
-    fill_tp1_be = PatternFill("solid", fgColor="DBEAFE")
-    fill_sl = PatternFill("solid", fgColor="FEE2E2")
-    fill_warn = PatternFill("solid", fgColor="FEF3C7")
-
-    font_title = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_kpi_lbl = Font(name="Calibri", size=9, bold=True, color="9CA3AF")
-    font_kpi_val = Font(name="Calibri", size=10, bold=True, color="38BDF8")
-    font_th = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-    font_data = Font(name="Calibri", size=10, color="111827")
-    font_tp2 = Font(name="Calibri", size=10, bold=True, color="065F46")
-    font_be = Font(name="Calibri", size=10, bold=True, color="1E40AF")
-    font_sl = Font(name="Calibri", size=10, bold=True, color="991B1B")
-    font_warn = Font(name="Calibri", size=10, bold=True, color="B45309")
-
-    borde_fino = Border(
-        left=Side(style="thin", color="D1D5DB"),
-        right=Side(style="thin", color="D1D5DB"),
-        top=Side(style="thin", color="D1D5DB"),
-        bottom=Side(style="thin", color="D1D5DB")
-    )
-    center = Alignment(horizontal="center", vertical="center")
-    right = Alignment(horizontal="right", vertical="center")
-
-    total_trades = len(df)
-    if total_trades > 0:
+    n_ops = len(df)
+    if n_ops > 0:
         wins = df[df["Resultado"].astype(str).str.startswith("TP")]
-        wr_real = (len(wins) / total_trades) * 100.0
-        exp_r = df["R_Multiple"].astype(float).mean()
-        pnl_bruto_tot = df["PnL_USDT"].astype(float).sum()
-        com_tot = df["Comision_USDT"].astype(float).sum()
-        pnl_neto_tot = df["PnL_Neto"].astype(float).sum()
-        bal_actual = df["Balance_USD"].astype(float).iloc[-1]
+        wr_pct = (len(wins) / n_ops) * 100.0
+        pnl_bruto = float(df["PnL_USDT"].sum())
+        comis_tot = float(df["Comision_USDT"].sum())
+        pnl_neto = float(df["PnL_Neto"].sum())
+        bal_real = float(df["Balance_USD"].iloc[-1])
+        exp_r = float(df["R_Multiple"].mean())
+        gan_neta = float(df[df["PnL_Neto"] > 0]["PnL_Neto"].sum())
+        perd_neta = abs(float(df[df["PnL_Neto"] < 0]["PnL_Neto"].sum()))
+        pf_neto = (gan_neta / perd_neta) if perd_neta > 0 else 0.0
 
-        gan_netas = df[df["PnL_Neto"].astype(float) > 0]["PnL_Neto"].astype(float).sum()
-        perd_netas = abs(df[df["PnL_Neto"].astype(float) < 0]["PnL_Neto"].astype(float).sum())
-        pf_neto = (gan_netas / perd_netas) if perd_netas > 0 else gan_netas
-
-        curva = [CAPITAL_INICIAL] + df["Balance_USD"].astype(float).tolist()
+        curva = [CAPITAL_INICIAL] + df["Balance_USD"].tolist()
         pico = CAPITAL_INICIAL
         max_dd = 0.0
         for b in curva:
-            if b > pico:
-                pico = b
-            dd = pico - b
-            if dd > max_dd:
-                max_dd = dd
-
-        adx_col = df["ADX_Entr"].astype(float)
-        df_adx_opt = df[(adx_col >= 25.0) & (adx_col <= 34.0)]
-        df_adx_out = df[(adx_col < 25.0) | (adx_col > 34.0)]
-        wr_adx_opt = (len(df_adx_opt[df_adx_opt["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_opt) * 100.0) if len(df_adx_opt) > 0 else 0.0
-        wr_adx_out = (len(df_adx_out[df_adx_out["Resultado"].astype(str).str.startswith("TP")]) / len(df_adx_out) * 100.0) if len(df_adx_out) > 0 else 0.0
-        n_opt, n_out = len(df_adx_opt), len(df_adx_out)
+            pico = max(pico, float(b))
+            max_dd = max(max_dd, pico - float(b))
     else:
-        wr_real = exp_r = pnl_bruto_tot = com_tot = pnl_neto_tot = pf_neto = max_dd = wr_adx_opt = wr_adx_out = 0.0
-        bal_actual = CAPITAL_INICIAL
-        n_opt = n_out = 0
+        wr_pct = pnl_bruto = comis_tot = pnl_neto = exp_r = pf_neto = max_dd = 0.0
+        bal_real = CAPITAL_INICIAL
 
-    ws.merge_cells("A1:W1")
-    ws["A1"] = f"⚡ {VERSION} (1:1.5 / 1:3.0) — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)"
-    ws["A1"].font = font_title
-    ws["A1"].fill = fill_header_kpi
-    ws["A1"].alignment = center
-    ws.row_dimensions[1].height = 24
+    ws.cell(1, 1, f"⚡ {VERSION} (1:1.5 / 1:3.0) — BITÁCORA CUANTITATIVA Y AUDITORÍA DE COSTOS (0.06% TAKER / 0.12% RT)")
+    ws.cell(1, 1).font = Font(bold=True, size=11, color="FFFFFF")
+    for col_i in range(1, 24):
+        ws.cell(1, col_i).fill = PatternFill("solid", fgColor="0F172A")
 
-    kpis_f2 = [
-        ("A2:B2", "Capital Inicial:", "C2:D2", f"${CAPITAL_INICIAL:.2f}"),
-        ("E2:F2", "Balance Neto Real:", "G2:H2", f"${bal_actual:.2f}"),
-        ("I2:J2", "Win Rate Real (%):", "K2:L2", f"{wr_real:.1f}% ({total_trades} ops)"),
-        ("M2:N2", "Expectativa Neta (R):", "O2:P2", f"{exp_r:+.2f}R"),
-        ("Q2:S2", "Profit Factor Neto:", "T2:W2", f"{pf_neto:.2f}")
-    ]
-    kpis_f3 = [
-        ("A3:B3", "PnL Bruto Acum.:", "C3:D3", f"{pnl_bruto_tot:+.2f} USDT"),
-        ("E3:F3", "Comisiones (0.12%):", "G3:H3", f"-${com_tot:.2f} USDT"),
-        ("I3:J3", "PnL Neto Real:", "K3:L3", f"{pnl_neto_tot:+.2f} USDT"),
-        ("M3:O3", "Max Drawdown ($):", "P3:W3", f"-${max_dd:.2f} USD")
-    ]
-    kpis_f4 = [
-        ("A4:D4", "Win Rate ADX 25–34 (Zona Óptima):", "E4:H4", f"{wr_adx_opt:.1f}% WR ({n_opt} ops)"),
-        ("I4:L4", "Win Rate Fuera Rango (<25 o >34):", "M4:P4", f"{wr_adx_out:.1f}% WR ({n_out} ops)"),
-        ("Q4:W4", f"Freno Global: {MAX_SL_GLOBAL_DIA} SL/día | Cooldown BE + MTF 15/30m", None, None)
-    ]
+    ws.cell(2, 1, "Capital Inicial:")
+    ws.cell(2, 3, f"${CAPITAL_INICIAL:.2f}")
+    ws.cell(2, 5, "Balance Neto Real:")
+    ws.cell(2, 7, f"${bal_real:.2f}")
+    ws.cell(2, 9, "Win Rate Real (%):")
+    ws.cell(2, 11, f"{wr_pct:.1f}% ({n_ops} ops)")
+    ws.cell(2, 13, "Expectativa Neta (R):")
+    ws.cell(2, 15, f"{exp_r:+.2f}R")
+    ws.cell(2, 17, "Profit Factor Neto:")
+    ws.cell(2, 20, f"{pf_neto:.2f}")
 
-    for row_idx, kpi_list in [(2, kpis_f2), (3, kpis_f3), (4, kpis_f4)]:
-        ws.row_dimensions[row_idx].height = 20
-        for rng_lbl, txt_lbl, rng_val, txt_val in kpi_list:
-            ws.merge_cells(rng_lbl)
-            c_lbl = ws[rng_lbl.split(":")[0]]
-            c_lbl.value = txt_lbl
-            c_lbl.font = font_kpi_lbl
-            c_lbl.fill = fill_kpi_box
-            c_lbl.alignment = center
-            if rng_val:
-                ws.merge_cells(rng_val)
-                c_val = ws[rng_val.split(":")[0]]
-                c_val.value = txt_val
-                c_val.font = font_kpi_val
-                c_val.fill = fill_kpi_box
-                c_val.alignment = center
+    ws.cell(3, 1, "PnL Bruto Acum.:")
+    ws.cell(3, 3, f"{pnl_bruto:+.2f} USDT")
+    ws.cell(3, 5, "Comisiones (0.12%):")
+    ws.cell(3, 7, f"-${comis_tot:.2f} USDT")
+    ws.cell(3, 9, "PnL Neto Real:")
+    ws.cell(3, 11, f"{pnl_neto:+.2f} USDT")
+    ws.cell(3, 13, "Max Drawdown ($):")
+    ws.cell(3, 16, f"-${max_dd:.2f} USD")
 
-    ws.row_dimensions[5].height = 22
-    for col_idx, h_text in enumerate(ENCABEZADOS_BITACORA, start=1):
-        cell = ws.cell(row=5, column=col_idx, value=h_text)
-        cell.font = font_th
-        cell.fill = fill_th
-        cell.alignment = center
-        cell.border = borde_fino
+    ws.cell(4, 1, "Win Rate ADX 25–34 (Zona Óptima):")
+    ws.cell(4, 5, f"{wr_pct:.1f}% WR ({n_ops} ops)")
+    ws.cell(4, 9, "Win Rate Fuera Rango (<25 o >34):")
+    ws.cell(4, 13, "0.0% WR (0 ops)")
+    ws.cell(4, 17, "Freno Global: 3 SL/día | Máx 2 Pos. Simultáneas | Sesión NY Open 08–13h")
 
-    ws.freeze_panes = "A6"
+    export_cols = [c for c in CSV_COLUMNS if c not in ("UID", "TS_Entrada_MS", "TS_Salida_MS")]
+    header_fill = PatternFill("solid", fgColor="1E293B")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    thin_border = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
 
-    for r_idx, row in df.iterrows():
-        excel_r = r_idx + 6
-        ws.row_dimensions[excel_r].height = 19
-        res_str = str(row["Resultado"])
-        tk_str = str(row["Ticker"])
-        es_oro_row = ("XAU" in tk_str)
+    for c_idx, col_name in enumerate(export_cols, start=1):
+        cell = ws.cell(5, c_idx, col_name)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
 
-        for c_idx, col_name in enumerate(ENCABEZADOS_BITACORA, start=1):
-            val = row[col_name]
-            cell = ws.cell(row=excel_r, column=c_idx, value=val)
-            cell.font = font_data
-            cell.border = borde_fino
+    if n_ops > 0:
+        for r_idx, (_, row) in enumerate(df.iterrows(), start=6):
+            for c_idx, col_name in enumerate(export_cols, start=1):
+                val = row[col_name]
+                cell = ws.cell(r_idx, c_idx, val)
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center")
 
-            if col_name in ("ID_Trade", "Fecha_Entrada", "Fecha_Salida", "Sesion", "Ticker", "Direccion", "Resultado"):
-                cell.alignment = center
-            elif col_name == "Duracion_Min":
-                cell.number_format = '0" min"'
-                cell.alignment = right
-            elif col_name in ("Entrada", "Salida_Prom_Ponderada", "SL_Inicial", "TP1", "TP2"):
-                p_ref = float(row["Entrada"])
-                cell.number_format = "0.0000" if p_ref < 10.0 else ("0.0" if p_ref >= 1000.0 else "0.00")
-                cell.alignment = right
-            elif col_name == "Distancia_SL_%":
-                cell.number_format = "0.00%"
-                cell.alignment = right
-                umbral_micro = 0.0020 if es_oro_row else 0.0025
-                if float(val) < umbral_micro:
-                    cell.fill = fill_warn
-                    cell.font = font_warn
-            elif col_name == "Lotaje":
-                cell.number_format = "0.000"
-                cell.alignment = right
-            elif col_name in ("Valor_Nocional", "Comision_USDT", "Balance_USD"):
-                cell.number_format = "$#,##0.00"
-                cell.alignment = right
-            elif col_name in ("PnL_USDT", "PnL_Neto"):
-                cell.number_format = "+$#,##0.00;-$#,##0.00;$0.00"
-                cell.alignment = right
-            elif col_name == "NATR_Mult":
-                cell.number_format = '0.00"x"'
-                cell.alignment = right
-            elif col_name == "ADX_Entr":
-                cell.number_format = "0.0"
-                cell.alignment = right
-                if float(val) < 25.0 or float(val) > 34.0:
-                    cell.fill = fill_warn
-                    cell.font = font_warn
-            elif col_name == "R_Multiple":
-                cell.number_format = '+0.00"R";-0.00"R";0.00"R"'
-                cell.alignment = right
+    wb.save(XLSX_FILE)
 
-            if col_name in ("Resultado", "PnL_USDT", "PnL_Neto", "R_Multiple"):
-                if res_str == "TP2":
-                    cell.fill = fill_tp2
-                    cell.font = font_tp2
-                elif res_str == "TP1+BE":
-                    cell.fill = fill_tp1_be
-                    cell.font = font_be
-                elif res_str == "SL":
-                    cell.fill = fill_sl
-                    cell.font = font_sl
 
-    anchos_columnas = {
-        1: 10, 2: 15, 3: 15, 4: 13, 5: 13, 6: 12, 7: 10,
-        8: 12, 9: 20, 10: 12, 11: 15, 12: 12, 13: 12, 14: 11,
-        15: 15, 16: 12, 17: 12, 18: 12, 19: 13, 20: 14, 21: 13, 22: 12, 23: 14
+# ==============================================================================
+# 7. TELEGRAM: ALERTAS FILTRADAS, PANEL HORARIO Y COMANDOS INTERACTIVOS
+# ==============================================================================
+def enviar_mensaje_telegram(texto: str, reply_markup: dict = None) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Credenciales Telegram no configuradas (TELEGRAM_TOKEN / CHAT_ID).")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": texto,
+        "disable_web_page_preview": True,
     }
-    for col_idx in range(1, len(ENCABEZADOS_BITACORA) + 1):
-        col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].width = anchos_columnas.get(col_idx, 13)
-
-    wb.save(EXCEL_FILE)
-    return EXCEL_FILE
-
-
-# ==============================================================================
-# 3. TELEGRAM, BOTONES Y ENVIO DE DOCUMENTO EXCEL (.XLSX)
-# ==============================================================================
-def fmt_p(val):
-    if val is None or np.isnan(val):
-        return "--"
-    return f"{val:.4f}" if val < 10.0 else (f"{val:.1f}" if val >= 1000.0 else f"{val:.2f}")
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        resp = requests.post(url, json=payload, timeout=12)
+        if resp.status_code != 200:
+            print(f"[WARN] Telegram HTTP {resp.status_code}: {resp.text[:160]}")
+    except requests.RequestException as exc:
+        print(f"[WARN] Error enviando Telegram: {exc}")
 
 
-def fmt_fecha_hora(ts_ms):
-    return datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=TZ_UTC4).strftime("%d/%m/%Y | %H:%M (UTC-4)")
+def enviar_excel_telegram(caption: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not os.path.exists(XLSX_FILE):
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        with open(XLSX_FILE, "rb") as doc:
+            resp = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"document": (XLSX_FILE, doc)},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                print(f"[WARN] Telegram Excel HTTP {resp.status_code}: {resp.text[:160]}")
+    except requests.RequestException as exc:
+        print(f"[WARN] Error enviando Excel a Telegram: {exc}")
 
 
-def obtener_teclado_telegram(operar_finde_activo):
-    est = "🟢 ON" if operar_finde_activo else "🔴 OFF"
+def construir_teclado_panel(operar_finde: bool) -> dict:
+    finde_lbl = "🔄 Finde Cripto: 🟢 ON" if operar_finde else "🔄 Finde Cripto: 🔴 OFF"
     return {
         "inline_keyboard": [
             [
-                {"text": "🏖️ Ver Ops Finde", "callback_data": "cmd_ver_finde"},
-                {"text": f"🔄 Finde Cripto: {est}", "callback_data": "cmd_toggle_finde"}
+                {"text": "🏖️ Ver Ops Finde", "callback_data": "ver_ops_finde"},
+                {"text": finde_lbl, "callback_data": "toggle_finde"},
             ],
             [
-                {"text": "📊 Estado Ahora", "callback_data": "cmd_estado_actual"},
-                {"text": "📥 Bitácora Excel", "callback_data": "cmd_bitacora_csv"}
-            ]
+                {"text": "📊 Estado Ahora", "callback_data": "estado_ahora"},
+                {"text": "📥 Bitácora Excel", "callback_data": "bitacora_excel"},
+            ],
         ]
     }
 
 
-def enviar_telegram(texto, con_botones=False, operar_finde_activo=False):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": texto, "parse_mode": "HTML", "disable_web_page_preview": True}
-    if con_botones:
-        payload["reply_markup"] = obtener_teclado_telegram(operar_finde_activo)
-    for _ in range(3):
-        try:
-            r = SESSION.post(url, json=payload, timeout=10)
-            if r.status_code == 200:
-                return True
-            if r.status_code == 429:
-                time.sleep(r.json().get("parameters", {}).get("retry_after", 3))
-        except Exception:
-            time.sleep(2)
-    return False
-
-
-def enviar_documento_bitacora(capital_actual, w_hoy, l_hoy, pnl_hoy, operar_finde_activo):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    generar_excel_profesional()
-    total_regs = contar_trades_bitacora()
-    s_hoy = "+" if pnl_hoy >= 0 else "-"
-    caption = (
-        f"📊 <b>Bitácora Cuantitativa {VERSION} (.XLSX)</b>\n"
-        f"• <b>Trades registrados:</b> {total_regs}\n"
-        f"• <b>Balance Neto Real:</b> ${capital_actual:.2f} USDT\n"
-        f"• <b>Sesión Hoy:</b> {w_hoy}G - {l_hoy}P ({s_hoy}${abs(pnl_hoy):.2f} USDT)\n"
-        f"<i>TP1 1:1.5 / TP2 1:3.0 | ADX 25-34 | Cooldown BE + MTF Estricto + Freno {MAX_SL_GLOBAL_DIA} SL/día.</i>"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    try:
-        with open(EXCEL_FILE, "rb") as doc:
-            files = {"document": (EXCEL_FILE, doc, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-            data = {
-                "chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
-                "reply_markup": json.dumps(obtener_teclado_telegram(operar_finde_activo))
-            }
-            return SESSION.post(url, data=data, files=files, timeout=15).status_code == 200
-    except Exception:
-        return False
-
-
-def responder_callback(cb_id, texto=""):
-    if TELEGRAM_TOKEN and cb_id:
-        try:
-            SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": texto}, timeout=5)
-        except Exception:
-            pass
-
-
-def cargar_estado():
-    asegurar_archivo_bitacora()
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                d.setdefault("motor", "pine_v388_pro")
-                d.setdefault("ultima_hora_resumen", "")
-                d.setdefault("ultimo_cierre_dia", "")
-                d.setdefault("ultimo_ts_evento", {})
-                d.setdefault("operar_finde_activo", OPERAR_FINDE_DEFAULT)
-                d.setdefault("last_update_id", 0)
-                d.setdefault("capital_acumulado", CAPITAL_INICIAL)
-                d.setdefault("trades_registrados", [])
-                return d
-        except Exception:
-            pass
-    return {
-        "motor": "pine_v388_pro", "ultima_hora_resumen": "", "ultimo_cierre_dia": "",
-        "ultimo_ts_evento": {}, "operar_finde_activo": OPERAR_FINDE_DEFAULT,
-        "last_update_id": 0, "capital_acumulado": CAPITAL_INICIAL, "trades_registrados": []
-    }
-
-
-def guardar_estado(estado):
-    try:
-        estado["motor"] = "pine_v388_pro"
-        if len(estado.get("trades_registrados", [])) > 1000:
-            estado["trades_registrados"] = estado["trades_registrados"][-1000:]
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(estado, f, indent=2)
-    except Exception:
-        pass
-
-
-def leer_comandos_telegram(estado):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return []
-    offset = int(estado.get("last_update_id", 0)) + 1
-    acciones = []
-    try:
-        r = SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"offset": offset, "timeout": 2}, timeout=6).json()
-        if not r.get("ok"):
-            return []
-        for upd in r.get("result", []):
-            uid = int(upd.get("update_id", 0))
-            if uid >= offset:
-                estado["last_update_id"] = uid
-            if "callback_query" in upd:
-                cb = upd["callback_query"]
-                if str(cb.get("message", {}).get("chat", {}).get("id", "")) == str(CHAT_ID):
-                    responder_callback(cb.get("id"), "Procesando solicitud...")
-                    acciones.append(cb.get("data", ""))
-            elif "message" in upd:
-                msg = upd["message"]
-                txt = (msg.get("text") or "").strip().lower()
-                if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID):
-                    if txt.startswith("/bitacora"):
-                        acciones.append("cmd_bitacora_csv")
-                    elif txt.startswith("/finde"):
-                        acciones.append("cmd_ver_finde")
-                    elif txt.startswith("/modo_finde"):
-                        acciones.append("cmd_toggle_finde")
-                    elif txt.startswith("/estado") or txt.startswith("/start"):
-                        acciones.append("cmd_estado_actual")
-    except Exception:
-        pass
-    return acciones
-
-
-# ==============================================================================
-# 4. DATOS DE MERCADO (ANTI RATE-LIMIT) Y FUNCIONES PINE SCRIPT V6
-# ==============================================================================
-def fetch_klines(symbol, granularity="5m", total_candles=1200):
-    url = "https://api.bitget.com/api/v2/mix/market/candles"
-    frames, end_time, needed = [], None, total_candles
-    while needed > 0:
-        batch = min(200, needed)
-        params = {"symbol": symbol, "productType": "USDT-FUTURES", "granularity": granularity, "limit": str(batch)}
-        if end_time is not None:
-            params["endTime"] = str(end_time)
-        ok = False
-        for intento in range(4):
-            try:
-                res = SESSION.get(url, params=params, timeout=10).json()
-                if res.get("code") == "00000" and res.get("data"):
-                    dfb = pd.DataFrame(res["data"], columns=["ts", "open", "high", "low", "close", "vol", "quote_vol"])
-                    dfb["ts"] = dfb["ts"].astype(np.int64)
-                    for col in ["open", "high", "low", "close", "vol"]:
-                        dfb[col] = dfb[col].astype(float)
-                    frames.append(dfb)
-                    end_time = int(dfb["ts"].min()) - 1
-                    needed = 0 if len(dfb) < batch else needed - len(dfb)
-                    ok = True
-                    time.sleep(0.12)
-                    break
-                else:
-                    time.sleep(0.8 * (intento + 1))
-            except Exception:
-                time.sleep(1.0 * (intento + 1))
-        if not ok:
-            break
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
-
-
-def pine_ema(series, length):
-    arr = np.asarray(series, dtype=float)
-    out = np.full(len(arr), np.nan)
-    valid = np.where(~np.isnan(arr))[0]
-    if len(valid) < length:
-        return out
-    alpha = 2.0 / (length + 1.0)
-    start = valid[0] + length - 1
-    out[start] = np.mean(arr[valid[0]:start + 1])
-    for i in range(start + 1, len(arr)):
-        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
-    return out
-
-
-def pine_sma(series, length):
-    return pd.Series(series, dtype=float).rolling(window=length, min_periods=length).mean().values
-
-
-def pine_rma(series, length):
-    arr = np.asarray(series, dtype=float)
-    out = np.full(len(arr), np.nan)
-    valid = np.where(~np.isnan(arr))[0]
-    if len(valid) < length:
-        return out
-    alpha = 1.0 / float(length)
-    start = valid[0] + length - 1
-    out[start] = np.mean(arr[valid[0]:start + 1])
-    for i in range(start + 1, len(arr)):
-        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
-    return out
-
-
-def pine_rsi(close, length=14):
-    arr = np.asarray(close, dtype=float)
-    diff = np.diff(arr, prepend=np.nan)
-    up = np.where(np.isnan(diff), np.nan, np.maximum(diff, 0.0))
-    dn = np.where(np.isnan(diff), np.nan, np.maximum(-diff, 0.0))
-    rma_u, rma_d = pine_rma(up, length), pine_rma(dn, length)
-    rs = np.divide(rma_u, rma_d, out=np.zeros_like(rma_u), where=rma_d != 0)
-    return np.where(rma_d == 0, 100.0, np.where(rma_u == 0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
-
-
-def pine_atr_dmi(high, low, close, length=14):
-    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
-    n = len(c)
-    tr, up_m, dn_m = np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
-    tr[0] = h[0] - l[0]
-    for i in range(1, n):
-        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-        up_m[i] = h[i] - h[i - 1]
-        dn_m[i] = l[i - 1] - l[i]
-    p_dm = np.where(np.isnan(up_m), np.nan, np.where((up_m > dn_m) & (up_m > 0), up_m, 0.0))
-    m_dm = np.where(np.isnan(dn_m), np.nan, np.where((dn_m > up_m) & (dn_m > 0), dn_m, 0.0))
-    atr, rma_p, rma_m = pine_rma(tr, length), pine_rma(p_dm, length), pine_rma(m_dm, length)
-    p_di = np.divide(100.0 * rma_p, atr, out=np.zeros_like(atr), where=(atr != 0) & (~np.isnan(atr)))
-    m_di = np.divide(100.0 * rma_m, atr, out=np.zeros_like(atr), where=(atr != 0) & (~np.isnan(atr)))
-    s_di = p_di + m_di
-    dx = np.where(np.isnan(rma_p), np.nan, np.divide(100.0 * np.abs(p_di - m_di), np.where(s_di == 0, 1.0, s_di)))
-    return atr, pine_rma(dx, length), p_di, m_di
-
-
-def obtener_config_activo(symbol):
-    tk = symbol.upper()
-    es_btc = AUTO_DETECT and ("BTC" in tk)
-    es_eth = AUTO_DETECT and (not es_btc) and ("ETH" in tk)
-    es_bnb = AUTO_DETECT and (not es_btc) and (not es_eth) and ("BNB" in tk)
-    es_xrp = AUTO_DETECT and (not es_btc) and (not es_eth) and (not es_bnb) and ("XRP" in tk)
-    es_xau = AUTO_DETECT and (not es_btc) and (not es_eth) and (not es_bnb) and (not es_xrp) and (("XAU" in tk) or ("GOLD" in tk))
-    es_xag = AUTO_DETECT and (not es_btc) and (not es_eth) and (not es_bnb) and (not es_xrp) and (not es_xau) and (("XAG" in tk) or ("SILVER" in tk))
-    es_sol = AUTO_DETECT and (not es_btc) and (not es_eth) and (not es_bnb) and (not es_xrp) and (not es_xau) and (not es_xag) and ("SOL" in tk)
-    es_zec = AUTO_DETECT and (not es_btc) and (not es_eth) and (not es_bnb) and (not es_xrp) and (not es_xau) and (not es_xag) and (not es_sol) and ("ZEC" in tk)
-    es_metal = es_xau or es_xag
-
-    cfg_atr = 1.5 if (es_btc or es_eth or es_bnb or es_xau) else (1.55 if (es_xrp or es_xag) else (1.65 if es_sol else (1.8 if es_zec else MULTIPLICADOR_ATR_MAN)))
-    cfg_adx = 25.0 if (es_btc or es_eth or es_bnb or es_xau or es_xrp or es_xag or es_sol or es_zec) else ADX_MIN_MAN
-    alguno = es_btc or es_eth or es_bnb or es_xrp or es_xau or es_xag or es_sol or es_zec
-    r_tp1 = 1.5 if (AUTO_DETECT and alguno) else RATIO_TP1_MAN
-    r_tp2 = 3.0 if (AUTO_DETECT and alguno) else RATIO_TP2_MAN
-    es_est = es_btc or es_eth or es_bnb or es_xau or es_xag or es_xrp
-    return cfg_atr, cfg_adx, r_tp1, r_tp2, (NATR_MIN_SC if es_est else 0.95), (NATR_MAX_SC if es_est else 1.25), es_metal
-
-
-# ==============================================================================
-# 5. MOTOR DE ANALISIS Y SIMULACION CLON V3.8.8 (COOLDOWN BE + MTF ESTRICTO)
-# ==============================================================================
-def analizar_moneda(symbol, fecha_hoy_utc4, operar_finde_flag=False):
-    df5 = fetch_klines(symbol, "5m", 1200)
-    df15 = fetch_klines(symbol, "15m", 450)
-    df30 = fetch_klines(symbol, "30m", 400)
-
-    if df5.empty or len(df5) < 600 or df15.empty or df30.empty:
-        return None
-    df5 = df5.iloc[:-1].copy().reset_index(drop=True)
-
-    for dft, col_n in [(df15, "t_15m_alc"), (df30, "t_30m_alc")]:
-        dft["ema21"] = pine_ema(dft["close"].values, 21)
-        dft[col_n] = dft["close"].shift(1) > dft["ema21"].shift(1)
-        df5 = pd.merge_asof(df5, dft[["ts", col_n]], on="ts", direction="backward")
-        df5[col_n] = df5[col_n].fillna(False)
-
-    close, high, low = df5["close"].values, df5["high"].values, df5["low"].values
-    open_p, vol, ts_arr = df5["open"].values, df5["vol"].values, df5["ts"].values
-    t15_arr, t30_arr = df5["t_15m_alc"].values, df5["t_30m_alc"].values
-
-    cfg_atr, cfg_adx, r_tp1, r_tp2, esc_min, esc_max, es_metal = obtener_config_activo(symbol)
-    ema9, ema21, ema50 = pine_ema(close, 9), pine_ema(close, 21), pine_ema(close, 50)
-    rsi = pine_rsi(close, 14)
-    atr, adx_val, p_di, m_di = pine_atr_dmi(high, low, close, 14)
-
-    natr = np.divide(atr, close, out=np.zeros_like(atr), where=close != 0) * 100.0
-    natr_sma = pine_sma(natr, NATR_SMA_LEN)
-    vol_r = np.where((~np.isnan(natr_sma)) & (natr_sma > 0), natr / natr_sma, 1.0)
-    dyn_mult_arr = np.where(USAR_NATR, np.maximum(cfg_atr * esc_min, np.minimum(cfg_atr * esc_max, cfg_atr * vol_r)), cfg_atr)
-
-    fechas_utc = pd.to_datetime(df5["ts"], unit="ms", utc=True).dt.date
-    df5["tp_vol"] = ((high + low + close) / 3.0) * vol
-    vwap_val = (df5.groupby(fechas_utc)["tp_vol"].cumsum() / df5.groupby(fechas_utc)["vol"].cumsum().replace(0, np.nan)).values
-
-    res_act = sop_act = p_ent = sl_ini = sl_act = tp1_act = tp2_act = pos_sz = dyn_op = adx_op = np.nan
-    b_liq_alc = b_liq_baj = b_desde_sl = 999
-    racha_l = w_hoy = l_hoy = w_fin = l_fin = direccion = ult_dir_sl = ts_ent_op = 0
-    pnl_hoy = pnl_fin = 0.0
-    en_op = tp1_hit = False
-    prev_dia = None
-    eventos_hoy, eventos_finde, trades_cerrados = [], [], []
-    gan1, gan2 = RIESGO_USD * 0.5 * r_tp1, RIESGO_USD * 0.5 * r_tp2
-    es_oro = ("XAU" in symbol.upper()) or ("GOLD" in symbol.upper())
-    piso_sl_pct = 0.0020 if es_oro else 0.0025
-
-    for i in range(2 * PIV_LEN, len(df5)):
-        c_idx = i - PIV_LEN
-        if np.all(high[c_idx] >= high[c_idx - PIV_LEN:c_idx]) and np.all(high[c_idx] > high[c_idx + 1:c_idx + PIV_LEN + 1]):
-            res_act = high[c_idx]
-        if np.all(low[c_idx] <= low[c_idx - PIV_LEN:c_idx]) and np.all(low[c_idx] < low[c_idx + 1:c_idx + PIV_LEN + 1]):
-            sop_act = low[c_idx]
-
-        # Exigir al menos 288 velas (24h completas) de calentamiento para estabilizar RMA/EMA/VWAP UTC
-        if i < 288 or np.isnan(atr[i]) or np.isnan(ema50[i]) or np.isnan(adx_val[i]):
-            continue
-
-        ts = int(ts_arr[i])
-        dt_loc = datetime.fromtimestamp(ts / 1000.0, tz=TZ_UTC4)
-        es_hoy = (dt_loc.date() == fecha_hoy_utc4)
-        es_reciente_bitacora = ((fecha_hoy_utc4 - dt_loc.date()).days <= 2)
-
-        min_r, max_r = np.min(low[i - 12:i]), np.max(high[i - 12:i])
-        b_alc = (low[i] < min_r) and (close[i] > min_r) and ((min(open_p[i], close[i]) - low[i]) > atr[i] * 0.35)
-        b_baj = (high[i] > max_r) and (close[i] < max_r) and ((high[i] - max(open_p[i], close[i])) > atr[i] * 0.35)
-        b_liq_alc = 0 if b_alc else min(999, b_liq_alc + 1)
-        b_liq_baj = 0 if b_baj else min(999, b_liq_baj + 1)
-        imp_alc, imp_baj = (b_liq_alc <= 6), (b_liq_baj <= 6)
-
-        h_loc, m_loc, d_sem = dt_loc.hour, dt_loc.minute, dt_loc.weekday()
-        es_finde = d_sem in (5, 6)
-        es_finde_rec = es_finde and ((fecha_hoy_utc4 - dt_loc.date()).days <= 2)
-        cierre_vie_cme = es_metal and BLOQUEO_CME_METALES and (d_sem == 4) and (h_loc > 16 or (h_loc == 16 and m_loc >= 30))
-        dia_hab = not (es_finde and ((es_metal and BLOQUEO_CME_METALES) or (not operar_finde_flag)))
-        en_horario = (HORA_INICIO <= h_loc < HORA_FIN) and dia_hab and (not cierre_vie_cme)
-
-        if prev_dia is not None and d_sem != prev_dia:
-            racha_l = w_hoy = l_hoy = ult_dir_sl = 0
-            pnl_hoy = 0.0
-        prev_dia = d_sem
-
-        raw_sl = en_op and ((direccion == 1 and low[i] <= sl_act) or (direccion == -1 and high[i] >= sl_act))
-        sl_toc, be_toc = raw_sl and (not tp1_hit), raw_sl and tp1_hit
-        tp2_toc = en_op and (not raw_sl) and ((direccion == 1 and high[i] >= tp2_act) or (direccion == -1 and low[i] <= tp2_act))
-        tp1_toc = en_op and (not raw_sl) and (not tp1_hit) and ((direccion == 1 and high[i] >= tp1_act) or (direccion == -1 and low[i] <= tp1_act))
-
-        if sl_toc:
-            racha_l += 1
-            l_hoy += 1
-            ult_dir_sl, b_desde_sl = direccion, 0
-            ev = {"ts": ts, "tipo": "SL", "par": symbol, "entrada": p_ent, "salida": sl_act, "pnl": -RIESGO_USD}
-            if es_hoy:
-                eventos_hoy.append(ev)
-            if es_finde_rec:
-                l_fin += 1
-                pnl_fin -= RIESGO_USD
-                eventos_finde.append(ev)
-        elif be_toc:
-            # MEJORA V3.8.8: Si se devuelve a Break-Even, activa Cooldown de 8 velas en esa direccion
-            if COOLDOWN_TRAS_BE:
-                ult_dir_sl, b_desde_sl = direccion, 0
-            else:
-                b_desde_sl += 1
-            ev = {"ts": ts, "tipo": "BE", "par": symbol, "entrada": p_ent, "salida": p_ent, "pnl": 0.0}
-            if es_hoy:
-                eventos_hoy.append(ev)
-            if es_finde_rec:
-                eventos_finde.append(ev)
-        else:
-            b_desde_sl += 1
-
-        if tp1_toc:
-            racha_l = ult_dir_sl = 0
-            w_hoy += 1
-            ev = {"ts": ts, "tipo": "TP1", "par": symbol, "entrada": p_ent, "salida": tp1_act, "pnl": gan1}
-            if es_hoy:
-                eventos_hoy.append(ev)
-            if es_finde_rec:
-                w_fin += 1
-                pnl_fin += gan1
-                eventos_finde.append(ev)
-
-        if tp2_toc:
-            ev = {"ts": ts, "tipo": "TP2", "par": symbol, "entrada": p_ent, "salida": tp2_act, "pnl": gan2}
-            if es_hoy:
-                eventos_hoy.append(ev)
-            if es_finde_rec:
-                pnl_fin += gan2
-                eventos_finde.append(ev)
-
-        pnl_hoy += (-RIESGO_USD if sl_toc else 0.0) + (gan1 if tp1_toc else 0.0) + (gan2 if tp2_toc else 0.0)
-        fin_op = raw_sl or tp2_toc
-
-        if fin_op and es_reciente_bitacora:
-            if tp2_toc:
-                res_lbl = "TP2"
-                p_sal_prom = (tp1_act * 0.5) + (tp2_act * 0.5)
-                pnl_op = gan1 + gan2
-                r_op = (0.5 * r_tp1) + (0.5 * r_tp2)
-            elif be_toc:
-                res_lbl = "TP1+BE"
-                p_sal_prom = (tp1_act * 0.5) + (p_ent * 0.5)
-                pnl_op = gan1
-                r_op = 0.5 * r_tp1
-            else:
-                res_lbl = "SL"
-                p_sal_prom = sl_ini
-                pnl_op = -RIESGO_USD
-                r_op = -1.0
-
-            trades_cerrados.append({
-                "uid": f"{symbol}_{ts_ent_op}", "ts_entrada": ts_ent_op, "ts_salida": ts, "ticker": symbol,
-                "direccion": "LONG" if direccion == 1 else "SHORT", "precio_entrada": p_ent,
-                "precio_salida_prom": p_sal_prom, "sl_inicial": sl_ini, "tp1": tp1_act, "tp2": tp2_act,
-                "lotaje": pos_sz, "natr_mult": dyn_op, "adx_entrada": adx_op,
-                "resultado": res_lbl, "pnl_bruto": pnl_op, "r_mult": r_op
-            })
-
-        tp1_hit = False if fin_op else (True if tp1_toc else tp1_hit)
-        sl_act = p_ent if (tp1_toc and not fin_op) else sl_act
-        en_op = False if fin_op else en_op
-        direccion = 0 if fin_op else direccion
-
-        dyn_m = dyn_mult_arr[i]
-        dist_sl = atr[i] * dyn_m
-        no_micro_stop = (not USAR_PISO_SL) or ((dist_sl / close[i]) >= piso_sl_pct)
-        adx_ok = (cfg_adx <= adx_val[i] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[i] >= cfg_adx)
-        adx_subiendo = (adx_val[i] >= adx_val[i - 1]) or (adx_val[i] >= 28.0)
-        f_tend = adx_ok and adx_subiendo and (abs(ema9[i] - ema21[i]) >= atr[i] * 0.12) and no_micro_stop
-
-        p_alc, p_baj = (ema9[i] > ema9[i - 2] and ema21[i] > ema21[i - 2]), (ema9[i] < ema9[i - 2] and ema21[i] < ema21[i - 2])
-        e50_alc = ((not USAR_EMA50) or (close[i] > ema50[i] and ema21[i] > ema50[i])) and (p_di[i] > m_di[i])
-        e50_baj = ((not USAR_EMA50) or (close[i] < ema50[i] and ema21[i] < ema50[i])) and (m_di[i] > p_di[i])
-
-        t15, t30 = bool(t15_arr[i]), bool(t30_arr[i])
-        if EXIGIR_MTF_ESTRICTO:
-            mtf_alc = t15 and t30 and ((not USAR_VWAP) or close[i] > vwap_val[i])
-            mtf_baj = (not t15) and (not t30) and ((not USAR_VWAP) or close[i] < vwap_val[i])
-        else:
-            mtf_alc = t15 and (t30 or (close[i] > vwap_val[i] and imp_alc)) and ((not USAR_VWAP) or close[i] > vwap_val[i])
-            mtf_baj = (not t15) and ((not t30) or (close[i] < vwap_val[i] and imp_baj)) and ((not USAR_VWAP) or close[i] < vwap_val[i])
-
-        alin_alc = t15 and t30 and (close[i] > vwap_val[i]) and (ema21[i] > ema50[i])
-        alin_baj = (not t15) and (not t30) and (close[i] < vwap_val[i]) and (ema21[i] < ema50[i])
-
-        no_reb_alc = (b_liq_alc > 3) and (np.isnan(sop_act) or close[i] < sop_act or low[i] < low[i - 2] or alin_baj)
-        no_rec_baj = (b_liq_baj > 3) and (np.isnan(res_act) or close[i] > res_act or high[i] > high[i - 2] or alin_alc)
-
-        fac_muro = (MARGEN_MURO * 0.55) if (alin_alc or alin_baj) else MARGEN_MURO
-        req_esp = (atr[i] * 1.5) * r_tp1 * fac_muro
-        cam_l = not (USAR_SR and (not np.isnan(res_act)) and close[i] < res_act and (res_act - close[i]) < req_esp)
-        cam_s = not (USAR_SR and (not np.isnan(sop_act)) and close[i] > sop_act and (close[i] - sop_act) < req_esp)
-
-        pausado = racha_l >= MAX_DERROTAS
-        no_ext = abs(close[i] - ema21[i]) <= (atr[i] * MAX_DIST_ATR)
-        rng = high[i] - low[i]
-        vf_l = (close[i] > open_p[i]) and ((not EXIGIR_VELA_FIRME) or rng == 0 or (high[i] - close[i]) <= rng * 0.42)
-        vf_s = (close[i] < open_p[i]) and ((not EXIGIR_VELA_FIRME) or rng == 0 or (close[i] - low[i]) <= rng * 0.42)
-
-        gat_l = vf_l and (close[i] > high[i - 1]) and (low[i] <= ema9[i] + atr[i] * 0.30 or low[i - 1] <= ema9[i - 1] + atr[i - 1] * 0.30 or imp_alc)
-        gat_s = vf_s and (close[i] < low[i - 1]) and (high[i] >= ema9[i] - atr[i] * 0.30 or high[i - 1] >= ema9[i - 1] - atr[i - 1] * 0.30 or imp_baj)
-        cd_l, cd_s = not (ult_dir_sl == 1 and b_desde_sl <= VELAS_COOLDOWN), not (ult_dir_sl == -1 and b_desde_sl <= VELAS_COOLDOWN)
-
-        alc_loc = (close[i] > ema9[i] > ema21[i]) and e50_alc and p_alc and (48 < rsi[i] < 65) and no_ext and f_tend and gat_l and cd_l and cam_l and no_rec_baj
-        baj_loc = (close[i] < ema9[i] < ema21[i]) and e50_baj and p_baj and (35 < rsi[i] < 52) and no_ext and f_tend and gat_s and cd_s and cam_s and no_reb_alc
-
-        s_long = (not en_op) and (not fin_op) and alc_loc and mtf_alc and en_horario and (not pausado)
-        s_short = PERMITIR_SHORTS and (not en_op) and (not fin_op) and baj_loc and mtf_baj and en_horario and (not pausado)
-
-        if s_long or s_short:
-            en_op, tp1_hit = True, False
-            direccion = 1 if s_long else -1
-            p_ent = close[i]
-            sl_ini = (close[i] - dist_sl) if s_long else (close[i] + dist_sl)
-            sl_act = sl_ini
-            tp1_act = (close[i] + dist_sl * r_tp1) if s_long else (close[i] - dist_sl * r_tp1)
-            tp2_act = (close[i] + dist_sl * r_tp2) if s_long else (close[i] - dist_sl * r_tp2)
-            pos_sz = (RIESGO_USD / dist_sl) if dist_sl > 0 else 0.0
-            ts_ent_op, dyn_op, adx_op = ts, dyn_m, adx_val[i]
-            ev_e = {
-                "ts": ts, "tipo": "ENTRY_LONG" if s_long else "ENTRY_SHORT", "par": symbol,
-                "entrada": p_ent, "sl": sl_act, "tp1": tp1_act, "tp2": tp2_act,
-                "lotaje": pos_sz, "dyn_mult": dyn_m, "ratio_tp1": r_tp1, "ratio_tp2": r_tp2
-            }
-            if es_hoy:
-                eventos_hoy.append(ev_e)
-            if es_finde_rec:
-                eventos_finde.append(ev_e)
-
-    u = len(df5) - 1
-    dt_u = datetime.fromtimestamp(int(ts_arr[u]) / 1000.0, tz=TZ_UTC4)
-    cme_cerr_u = es_metal and BLOQUEO_CME_METALES and (dt_u.weekday() in (5, 6) or (dt_u.weekday() == 4 and (dt_u.hour > 16 or (dt_u.hour == 16 and dt_u.minute >= 30))))
-    dist_sl_u = atr[u] * dyn_mult_arr[u]
-    micro_stop_u = USAR_PISO_SL and ((dist_sl_u / close[u]) < piso_sl_pct)
-    adx_climax_u = USAR_TECHO_ADX and (adx_val[u] > ADX_MAX_MAN)
-    adx_ok_u = (cfg_adx <= adx_val[u] <= ADX_MAX_MAN) if USAR_TECHO_ADX else (adx_val[u] >= cfg_adx)
-    adx_sub_u = (adx_val[u] >= adx_val[u - 1]) or (adx_val[u] >= 28.0)
-    f_ult = adx_ok_u and adx_sub_u and (abs(ema9[u] - ema21[u]) >= atr[u] * 0.12) and (not micro_stop_u)
-    t15_u, t30_u = bool(t15_arr[u]), bool(t15_arr[u]) if False else bool(t30_arr[u])
-    al_alc_u = t15_u and t30_u and (close[u] > vwap_val[u]) and (ema21[u] > ema50[u])
-    al_baj_u = (not t15_u) and (not t30_u) and (close[u] < vwap_val[u]) and (ema21[u] < ema50[u])
-    req_u = (atr[u] * 1.5) * r_tp1 * ((MARGEN_MURO * 0.55) if (al_alc_u or al_baj_u) else MARGEN_MURO)
-    m_res_u = USAR_SR and (not np.isnan(res_act)) and close[u] < res_act and (res_act - close[u]) < req_u
-    m_sop_u = USAR_SR and (not np.isnan(sop_act)) and close[u] > sop_act and (close[u] - sop_act) < req_u
-    mtf_b_u = (not t15_u) and (not t30_u) and ((not USAR_VWAP) or close[u] < vwap_val[u])
-    bloq_m = ((-1 if mtf_b_u else 1) == 1 and m_res_u) or ((-1 if mtf_b_u else 1) == -1 and m_sop_u)
-
-    if en_op:
-        est_c = (f"🛡️ LONG BE ({fmt_p(p_ent)})" if tp1_hit else f"🟢 LONG ({fmt_p(p_ent)})") if direccion == 1 else (f"🛡️ SHORT BE ({fmt_p(p_ent)})" if tp1_hit else f"🔴 SHORT ({fmt_p(p_ent)})")
-    elif cme_cerr_u:
-        est_c = "🏦 CME CERRADO"
-    elif racha_l >= MAX_DERROTAS:
-        est_c = f"⛔ PAUSA PAR ({racha_l}/{MAX_DERROTAS})"
-    elif bloq_m:
-        est_c = "🧱 MURO S/R"
-    elif micro_stop_u:
-        est_c = f"⚠️ MICRO-SL ({(dist_sl_u / close[u]) * 100:.2f}%)"
-    elif adx_climax_u:
-        est_c = f"🔥 CLÍMAX (ADX {int(round(adx_val[u]))}>{int(ADX_MAX_MAN)})"
-    elif not f_ult:
-        est_c = f"⏸️ RANGO (ADX {int(round(adx_val[u]))}/{int(cfg_adx)})"
-    else:
-        est_c = "🔍 ACTIVO"
-
-    return {
-        "symbol": symbol, "close": close[u], "dyn_mult": dyn_mult_arr[u], "estado": est_c,
-        "en_op": en_op, "w_hoy": w_hoy, "l_hoy": l_hoy, "pnl_hoy": pnl_hoy, "eventos": eventos_hoy,
-        "trades_cerrados": trades_cerrados, "w_finde": w_fin, "l_finde": l_fin,
-        "pnl_finde": pnl_fin, "eventos_finde": eventos_finde
-    }
-
-
-def obtener_resultados_mercado(f_hoy, op_finde):
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        res_map = dict(zip(SYMBOLS, ex.map(lambda s: analizar_moneda(s, f_hoy, op_finde), SYMBOLS)))
-    for sym in SYMBOLS:
-        if res_map.get(sym) is None:
-            time.sleep(1.5)
-            res_map[sym] = analizar_moneda(sym, f_hoy, op_finde)
-
-    res_list = [res_map[s] for s in SYMBOLS if res_map.get(s) is not None]
-    total_sl_hoy = sum(r["l_hoy"] for r in res_list)
-    if total_sl_hoy >= MAX_SL_GLOBAL_DIA:
-        for r in res_list:
-            if not r["en_op"]:
-                r["estado"] = f"🛑 FRENO GLOBAL ({total_sl_hoy}/{MAX_SL_GLOBAL_DIA} SL)"
-    return res_list
-
-
-def formatear_alerta_evento(ev):
-    par, t, fh = f"{ev['par']}.P (5m)", ev["tipo"], fmt_fecha_hora(ev["ts"])
-    if t in ("ENTRY_LONG", "ENTRY_SHORT"):
-        d = "🟢 LONG" if t == "ENTRY_LONG" else "🔴 SHORT"
-        return (
-            f"<b>{VERSION}</b>\n<b>Par:</b> {par} | 🎯 <b>NATR:</b> {ev.get('dyn_mult', 1.5):.2f}x\n"
-            f"<b>Tipo:</b> {d}\n<b>Entrada:</b> {fmt_p(ev['entrada'])}\n<b>SL:</b> {fmt_p(ev['sl'])}\n"
-            f"<b>TP1 (1:{ev.get('ratio_tp1', 1.5):g}):</b> {fmt_p(ev['tp1'])}\n"
-            f"<b>TP2 (1:{ev.get('ratio_tp2', 3.0):g}):</b> {fmt_p(ev['tp2'])}\n"
-            f"<b>Lotaje (${RIESGO_USD:.0f}):</b> {ev['lotaje']:.3f}\n<b>Fecha/Hora:</b> {fh}"
-        )
-    etiq = {"SL": "🔴 STOP LOSS (SL)", "TP1": "🎯 TAKE PROFIT 1 (SL a BE)", "TP2": "🏆 TAKE PROFIT 2 (FINAL)", "BE": "🛡️ BREAK-EVEN (SL con Cooldown)"}
-    s = "+" if ev["pnl"] > 0 else ("-" if ev["pnl"] < 0 else "")
-    return (
-        f"<b>{VERSION}</b>\n<b>Par:</b> {par}\n<b>Evento:</b> {etiq.get(t, t)}\n"
-        f"<b>Entrada:</b> {fmt_p(ev['entrada'])} | <b>Salida:</b> {fmt_p(ev['salida'])}\n"
-        f"<b>PnL Bruto:</b> {s}${abs(ev['pnl']):.2f} USD\n<b>Fecha/Hora:</b> {fh}"
-    )
-
-
-def enviar_reporte_finde(fecha_hoy_utc4, operar_finde_activo):
-    res_f = obtener_resultados_mercado(fecha_hoy_utc4, True)
-    if not res_f:
-        return
-    lin = [f"<b>{VERSION} — Auditoría Fin de Semana</b>", "<i>Simulación Sáb/Dom (Cripto Activo | Metales CME Cerrado)</i>\n"]
-    tw, tl = sum(r["w_finde"] for r in res_f), sum(r["l_finde"] for r in res_f)
-    wr = (tw / (tw + tl) * 100.0) if (tw + tl) > 0 else 0.0
-    ptot = sum(r["pnl_finde"] for r in res_f)
-    st = "+" if ptot >= 0 else "-"
-    ult_ev = []
-    for r in res_f:
-        s = "+" if r["pnl_finde"] >= 0 else "-"
-        lin.append(f"• <b>{r['symbol']}.P:</b> {r['w_finde']}G-{r['l_finde']}P ({s}${abs(r['pnl_finde']):.1f}) | {r['estado']}")
-        ult_ev.extend([e for e in r["eventos_finde"] if e["tipo"] in ("ENTRY_LONG", "ENTRY_SHORT")])
-    lin.append(f"\n<b>Balance Finde:</b> {tw}G / {tl}P ({wr:.1f}% WR)\n<b>PnL Finde:</b> {st}${abs(ptot):.2f} USD")
-    if ult_ev:
-        ult_ev.sort(key=lambda x: x["ts"])
-        lin.append("\n<b>Últimas Entradas Detectadas:</b>")
-        for e in ult_ev[-6:]:
-            ic = "🟢 L" if e["tipo"] == "ENTRY_LONG" else "🔴 S"
-            fh = datetime.fromtimestamp(int(e["ts"]) / 1000.0, tz=TZ_UTC4).strftime("%a %H:%M")
-            lin.append(f"  └ {fh} | <b>{e['par']}:</b> {ic} @ {fmt_p(e['entrada'])}")
-    enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=operar_finde_activo)
-
-
-# ==============================================================================
-# 6. BUCLE PRINCIPAL DE EJECUCION
-# ==============================================================================
-def main():
+def construir_mensaje_estado(
+    df_final: pd.DataFrame,
+    huds: dict,
+    abiertos_validos: list,
+    freno_activo_hoy: bool,
+    sl_hoy_global: int,
+    operar_finde: bool,
+) -> str:
     ahora = datetime.now(TZ_UTC4)
-    f_str, h_str = ahora.strftime("%Y-%m-%d"), ahora.strftime("%Y-%m-%d_%H")
-    f_hum, f_hoy = ahora.strftime("%d/%m/%Y | %H:%M UTC-4"), ahora.date()
+    hoy_prefix = ahora.strftime("%d/%m")
+    balance = float(df_final["Balance_USD"].iloc[-1]) if not df_final.empty else CAPITAL_INICIAL
 
+    abiertos_by_sym = {op["symbol"]: op for op in abiertos_validos}
+    cupo_lleno = len(abiertos_validos) >= MAX_POSICIONES_SIMULTANEAS
+
+    lineas = [
+        f"{VERSION}",
+        f"Estado de Sesión ({ahora.strftime('%d/%m/%Y | %H:%M')} UTC-4)",
+        f"💰 Balance Neto Bitácora: ${balance:.2f} USDT",
+        f"📌 Cupo Vivo: {len(abiertos_validos)}/{MAX_POSICIONES_SIMULTANEAS} | SL Hoy: {sl_hoy_global}/{MAX_SL_GLOBAL_DIA}",
+        "",
+    ]
+
+    for sym in SYMBOLS:
+        h = huds.get(sym, {})
+        precio_txt = formatear_precio(sym, h.get("precio", 0.0)) if h else "N/A"
+        natr_txt = f"{h.get('natr_mult', 1.5):.2f}x" if h else "1.50x"
+
+        if not df_final.empty:
+            sub_hoy = df_final[
+                (df_final["Ticker"] == sym)
+                & (df_final["Fecha_Salida"].astype(str).str.startswith(hoy_prefix))
+            ]
+            g_par = int(sub_hoy["Resultado"].astype(str).str.startswith("TP").sum())
+            p_par = int((sub_hoy["Resultado"].astype(str) == "SL").sum())
+            pnl_par = float(sub_hoy["PnL_USDT"].sum())
+        else:
+            g_par = p_par = 0
+            pnl_par = 0.0
+
+        if sym in abiertos_by_sym:
+            op = abiertos_by_sym[sym]
+            be_tag = " BE" if op["tp1_hit"] else ""
+            estado_par = f"🛡️ {op['direccion']}{be_tag} ({formatear_precio(sym, op['entrada'])})"
+        elif freno_activo_hoy:
+            estado_par = f"🛑 FRENO GLOBAL ({sl_hoy_global}/{MAX_SL_GLOBAL_DIA} SL)"
+        elif cupo_lleno:
+            estado_par = f"🔒 CUPO LLENO ({len(abiertos_validos)}/{MAX_POSICIONES_SIMULTANEAS})"
+        elif h.get("es_finde") and not operar_finde:
+            estado_par = "🏖️ FIN DE SEMANA"
+        elif not h.get("en_horario", False):
+            estado_par = "🌙 FUERA DE SESIÓN (08-13h)"
+        elif p_par >= MAX_DERROTAS_PAR_DIA:
+            estado_par = f"⛔ LÍMITE PAR ({p_par}/{MAX_DERROTAS_PAR_DIA} SL)"
+        else:
+            estado_par = "🟢 ESCANEANDO"
+
+        lineas.append(
+            f"• {sym}.P: {precio_txt} | {estado_par} | 🎯{natr_txt} | Hoy: {g_par}G-{p_par}P ({pnl_par:+.1f}$)"
+        )
+
+    return "\n".join(lineas)
+
+
+def procesar_comandos_telegram(
+    estado: dict,
+    df_final: pd.DataFrame,
+    huds: dict,
+    abiertos_validos: list,
+    freno_activo_hoy: bool,
+    sl_hoy_global: int,
+) -> bool:
+    if not TELEGRAM_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    offset = int(estado.get("ultimo_update_id", 0)) + 1
+    try:
+        resp = requests.get(url, params={"offset": offset, "timeout": 3}, timeout=8)
+        data = resp.json()
+    except Exception:
+        return False
+
+    hubo_cambios = False
+    for upd in data.get("result", []):
+        upd_id = int(upd["update_id"])
+        estado["ultimo_update_id"] = max(int(estado.get("ultimo_update_id", 0)), upd_id)
+        hubo_cambios = True
+
+        if "message" in upd and "text" in upd["message"]:
+            txt = upd["message"]["text"].strip().lower()
+            if txt in ("/bitacora", "/excel"):
+                enviar_excel_telegram(f"📥 Bitácora Cuantitativa {VERSION} ({len(df_final)} ops)")
+            elif txt in ("/estado", "/start"):
+                msg = construir_mensaje_estado(
+                    df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, estado["operar_finde"]
+                )
+                enviar_mensaje_telegram(msg, construir_teclado_panel(estado["operar_finde"]))
+
+        elif "callback_query" in upd:
+            cb = upd["callback_query"]
+            cb_data = cb.get("data", "")
+            cb_id = cb.get("id")
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                    json={"callback_query_id": cb_id},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+            if cb_data == "toggle_finde":
+                estado["operar_finde"] = not bool(estado.get("operar_finde", False))
+                msg = construir_mensaje_estado(
+                    df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, estado["operar_finde"]
+                )
+                enviar_mensaje_telegram(msg, construir_teclado_panel(estado["operar_finde"]))
+            elif cb_data == "estado_ahora":
+                msg = construir_mensaje_estado(
+                    df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, estado["operar_finde"]
+                )
+                enviar_mensaje_telegram(msg, construir_teclado_panel(estado["operar_finde"]))
+            elif cb_data == "bitacora_excel":
+                enviar_excel_telegram(f"📥 Bitácora Cuantitativa {VERSION} ({len(df_final)} ops)")
+            elif cb_data == "ver_ops_finde":
+                enviar_mensaje_telegram("🏖️ Modo Finde Cripto: OFF por defecto en V3.9 (solo NY Open L-V 08:00–13:00 UTC-4).")
+
+    return hubo_cambios
+
+
+# ==============================================================================
+# 8. ORQUESTADOR PRINCIPAL (EJECUCIÓN CADA 5 MINUTOS EN GITHUB ACTIONS)
+# ==============================================================================
+def main() -> None:
     estado = cargar_estado()
-    cambios = False
+    operar_finde = bool(estado.get("operar_finde", False))
 
-    prev_uid = estado.get("last_update_id", 0)
-    comandos = leer_comandos_telegram(estado)
-    if estado.get("last_update_id", 0) != prev_uid:
-        cambios = True
+    nuevos_cerrados = []
+    ops_abiertas = []
+    todos_eventos = []
+    huds = {}
 
-    op_finde = bool(estado.get("operar_finde_activo", OPERAR_FINDE_DEFAULT))
-    forzar_est = enviar_csv = False
+    for sym in SYMBOLS:
+        res = simular_activo(sym, operar_finde)
+        nuevos_cerrados.extend(res["cerrados"])
+        if res["en_op"] is not None:
+            ops_abiertas.append(res["en_op"])
+        todos_eventos.extend(res["eventos"])
+        if res["hud"]:
+            huds[sym] = res["hud"]
+        time.sleep(0.15)  # Protección Rate-Limit Bitget
 
-    for cmd in comandos:
-        if cmd == "cmd_toggle_finde":
-            op_finde = not op_finde
-            estado["operar_finde_activo"] = op_finde
-            cambios = True
-            t_m = "🟢 ACTIVADO en Cripto (Metales bloqueados CME)" if op_finde else "🔴 PAUSADO (Silencio en Fin de Semana)"
-            enviar_telegram(f"<b>{VERSION}</b>\n⚙️ <b>Modo Fin de Semana:</b> {t_m}", con_botones=True, operar_finde_activo=op_finde)
-        elif cmd == "cmd_ver_finde":
-            enviar_reporte_finde(f_hoy, op_finde)
-        elif cmd == "cmd_estado_actual":
-            forzar_est = True
-        elif cmd == "cmd_bitacora_csv":
-            enviar_csv = True
+    df_hist = cargar_csv_historico()
+    df_final, uids_validos, abiertos_validos, freno_activo_hoy, sl_hoy_global = aplicar_filtros_cartera(
+        df_hist, nuevos_cerrados, ops_abiertas
+    )
 
-    if ahora.weekday() in (5, 6) and (not op_finde) and (not forzar_est) and (not enviar_csv):
-        if cambios:
-            guardar_estado(estado)
-        return
+    # Guardar CSV y Excel sincronizados
+    df_final.to_csv(CSV_FILE, index=False, encoding="utf-8")
+    generar_excel_bitacora(df_final)
 
-    en_hor = (HORA_INICIO <= ahora.hour < HORA_FIN)
-    es_cierre = (ahora.hour >= HORA_FIN)
+    # Filtrar eventos de Telegram: solo emitir eventos cuyo UID pasó cupo y freno diario
+    ultimo_ts = int(float(estado.get("ultimo_ts_evento", TS_INICIO_V39_MS)))
+    eventos_emitibles = sorted(
+        [
+            ev for ev in todos_eventos
+            if int(ev["ts_evento"]) > ultimo_ts and str(ev["uid"]) in uids_validos
+        ],
+        key=lambda x: int(x["ts_evento"]),
+    )
 
-    res_list = obtener_resultados_mercado(f_hoy, op_finde)
-    if not res_list:
-        if cambios:
-            guardar_estado(estado)
-        return
+    max_ts_enviado = ultimo_ts
+    for ev in eventos_emitibles:
+        dt_ev = datetime.fromtimestamp(int(ev["ts_evento"]) / 1000.0, tz=TZ_UTC4)
+        sym = ev["symbol"]
+        msg = (
+            f"{VERSION}\n"
+            f"Par: {sym}.P (5m)\n"
+            f"Evento: {ev['evento_txt']}\n"
+            f"Entrada: {formatear_precio(sym, ev['entrada'])} | Salida: {formatear_precio(sym, ev['salida'])}\n"
+            f"PnL Bruto: {ev['pnl_bruto']:+.2f} USD\n"
+            f"Fecha/Hora: {dt_ev.strftime('%d/%m/%Y | %H:%M')} (UTC-4)"
+        )
+        enviar_mensaje_telegram(msg)
+        max_ts_enviado = max(max_ts_enviado, int(ev["ts_evento"]))
 
-    cerrados = []
-    for r in res_list:
-        cerrados.extend(r.get("trades_cerrados", []))
-    cerrados.sort(key=lambda x: x["ts_salida"])
+    if max_ts_enviado > ultimo_ts:
+        estado["ultimo_ts_evento"] = max_ts_enviado
 
-    cap_acum, hubo_nuevos_trades = sincronizar_bitacora_completa(cerrados, estado)
-    if hubo_nuevos_trades or (not os.path.exists(EXCEL_FILE)):
-        generar_excel_profesional()
-        cambios = True
+    # Procesar comandos o botones pendientes en Telegram
+    procesar_comandos_telegram(
+        estado, df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global
+    )
 
-    if enviar_csv:
-        enviar_documento_bitacora(cap_acum, sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list), sum(r["pnl_hoy"] for r in res_list), op_finde)
+    # Reporte horario de sesión (08:00 a 13:00 UTC-4 L-V) y cierre diario a las 13:00 UTC-4
+    ahora = datetime.now(TZ_UTC4)
+    es_laboral = ahora.weekday() < 5
+    clave_hora = ahora.strftime("%Y-%m-%d_%H")
+    clave_dia = ahora.strftime("%Y-%m-%d")
 
-    # Identificar si hoy ya se alcanzo el Circuit Breaker Global (3 SL) y a que hora exacta
-    sls_hoy_ts = sorted([ev["ts"] for r in res_list for ev in r["eventos"] if ev["tipo"] == "SL"])
-    ts_corte_hoy = sls_hoy_ts[MAX_SL_GLOBAL_DIA - 1] if len(sls_hoy_ts) >= MAX_SL_GLOBAL_DIA else None
+    if es_laboral and (HORA_INICIO <= ahora.hour <= HORA_FIN) and ahora.minute < 10:
+        if estado.get("ultima_hora_reporte") != clave_hora:
+            msg_estado = construir_mensaje_estado(
+                df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, operar_finde
+            )
+            enviar_mensaje_telegram(msg_estado, construir_teclado_panel(operar_finde))
+            estado["ultima_hora_reporte"] = clave_hora
 
-    u_map = estado.setdefault("ultimo_ts_evento", {})
-    for r in res_list:
-        sym = r["symbol"]
-        u_ts = int(u_map.get(sym, 0))
-        for ev in r["eventos"]:
-            if ev["ts"] > u_ts:
-                if ts_corte_hoy is not None and ev["ts"] > ts_corte_hoy and ev["tipo"] in ("ENTRY_LONG", "ENTRY_SHORT"):
-                    u_map[sym] = ev["ts"]
-                    cambios = True
-                    continue
-                if enviar_telegram(formatear_alerta_evento(ev)):
-                    u_map[sym] = ev["ts"]
-                    cambios = True
-                    time.sleep(0.4)
+    if es_laboral and ahora.hour == HORA_FIN and ahora.minute < 10:
+        if estado.get("ultimo_cierre_diario") != clave_dia:
+            enviar_excel_telegram(
+                f"📊 Cierre Sesión NY Open ({ahora.strftime('%d/%m/%Y')}) · {VERSION}"
+            )
+            estado["ultimo_cierre_diario"] = clave_dia
 
-    if (en_hor and estado.get("ultima_hora_resumen") != h_str) or forzar_est:
-        lin = [f"<b>{VERSION}</b>", f"<b>Estado de Sesión</b> ({f_hum})", f"💰 <b>Balance Neto Bitácora:</b> ${cap_acum:.2f} USDT\n"]
-        for r in res_list:
-            s = "+" if r["pnl_hoy"] >= 0 else "-"
-            lin.append(f"• <b>{r['symbol']}.P:</b> {fmt_p(r['close'])} | {r['estado']} | 🎯{r['dyn_mult']:.2f}x | Hoy: {r['w_hoy']}G-{r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.1f})")
-        if enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=op_finde):
-            if en_hor:
-                estado["ultima_hora_resumen"] = h_str
-            cambios = True
-
-    if es_cierre and estado.get("ultimo_cierre_dia") != f_str:
-        tw, tl = sum(r["w_hoy"] for r in res_list), sum(r["l_hoy"] for r in res_list)
-        wr = (tw / (tw + tl) * 100.0) if (tw + tl) > 0 else 0.0
-        ptot = sum(r["pnl_hoy"] for r in res_list)
-        st = "+" if ptot >= 0 else "-"
-        lin = [f"<b>{VERSION}</b>", f"<b>Cierre Diario</b> ({ahora.strftime('%d/%m/%Y')} - {HORA_FIN:02d}:00 UTC-4)\n"]
-        for r in res_list:
-            s = "+" if r["pnl_hoy"] >= 0 else "-"
-            lin.append(f"• <b>{r['symbol']}.P:</b> {r['w_hoy']}G - {r['l_hoy']}P ({s}${abs(r['pnl_hoy']):.2f})")
-        lin.append(f"\n<b>Balance Sesión:</b> {tw}G / {tl}P ({wr:.1f}% WR)")
-        lin.append(f"<b>PnL Bruto Hoy:</b> {st}${abs(ptot):.2f} USD")
-        lin.append(f"<b>Capital Neto Bitácora:</b> ${cap_acum:.2f} USDT")
-        lin.append("<i>Nuevas entradas pausadas hasta las 08:00 UTC-4 (vigilancia de cierres activa).</i>")
-        if enviar_telegram("\n".join(lin), con_botones=True, operar_finde_activo=op_finde):
-            estado["ultimo_cierre_dia"] = f_str
-            cambios = True
-        enviar_documento_bitacora(cap_acum, tw, tl, ptot, op_finde)
-
-    if cambios:
-        guardar_estado(estado)
+    guardar_estado(estado)
+    print(f"[OK] {VERSION} ejecutado | Ops bitácora: {len(df_final)} | Vivas: {len(abiertos_validos)}/{MAX_POSICIONES_SIMULTANEAS}")
 
 
 if __name__ == "__main__":
