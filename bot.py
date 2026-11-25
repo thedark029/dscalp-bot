@@ -44,6 +44,7 @@ SYMBOLS = [
 # Parámetros de Riesgo, Cartera y Sesión (UTC-4 Venezuela)
 TZ_UTC4 = timezone(timedelta(hours=-4))
 TS_INICIO_V39_MS = 1795521600000  # 24/11/2026 08:00:00 UTC-4 (Arranque limpio V3.9)
+VENTANA_CIERRE_VALIDO_MS = 2 * 3_600_000  # Máximo 2 horas de tolerancia para cierres nuevos (bloquea fantasmas de días previos)
 
 CAPITAL_INICIAL = 100.0
 RIESGO_PCT = 2.0
@@ -264,13 +265,24 @@ def calcular_atr_adx(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
 
 
 def calcular_vwap_utc(df: pd.DataFrame) -> pd.Series:
+    """
+    Calcula VWAP diario anclado a 00:00 UTC.
+    Anula con NaN el primer día UTC del DataFrame si no arranca en 00:00 UTC
+    para impedir trades fantasma retroactivos por deriva de ventana deslizante.
+    """
     dt_utc = pd.to_datetime(df["ts"], unit="ms", utc=True)
     dia_utc = dt_utc.dt.date
     hlc3 = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = hlc3 * df["vol_base"]
     cum_pv = pv.groupby(dia_utc).cumsum()
     cum_vol = df["vol_base"].groupby(dia_utc).cumsum().replace(0.0, math.nan)
-    return cum_pv / cum_vol
+    vwap = cum_pv / cum_vol
+
+    if not df.empty:
+        p0 = dt_utc.iloc[0]
+        if not (p0.hour == 0 and p0.minute == 0):
+            vwap = vwap.mask(dia_utc == dia_utc.iloc[0], math.nan)
+    return vwap
 
 
 def obtener_serie_trend_mtf(df_mtf: pd.DataFrame, tf_ms: int) -> list:
@@ -328,7 +340,8 @@ def formatear_precio(symbol: str, val: float) -> str:
 # 4. SIMULACIÓN DETERMINISTA POR ACTIVO (VELAS CERRADAS 5m)
 # ==============================================================================
 def simular_activo(symbol: str, operar_finde: bool) -> dict:
-    df5 = descargar_velas_bitget(symbol, "5m", limit=350)
+    # 400 velas de 5m = 33h 20m -> garantiza el día UTC completo + calentamiento de EMA/ADX
+    df5 = descargar_velas_bitget(symbol, "5m", limit=400)
     df15 = descargar_velas_bitget(symbol, "15m", limit=150)
     df30 = descargar_velas_bitget(symbol, "30m", limit=100)
 
@@ -900,7 +913,6 @@ def generar_excel_bitacora(df: pd.DataFrame) -> None:
         bal_real = CAPITAL_INICIAL
         pf_txt = "0.00"
 
-    # Paleta visual consistente con v3.8.8 (optimizada para escritorio y móvil)
     fill_banner = PatternFill("solid", fgColor="111827")
     fill_kpi = PatternFill("solid", fgColor="1F2937")
     fill_header = PatternFill("solid", fgColor="0F172A")
@@ -1342,13 +1354,19 @@ def construir_mensaje_estado(
     freno_activo_hoy: bool,
     sl_hoy_global: int,
     operar_finde: bool,
+    ahora: datetime = None,
 ) -> str:
-    ahora = datetime.now(TZ_UTC4)
+    if ahora is None:
+        ahora = datetime.now(TZ_UTC4)
     hoy_prefix = ahora.strftime("%d/%m")
     balance = float(df_final["Balance_USD"].iloc[-1]) if not df_final.empty else CAPITAL_INICIAL
 
     abiertos_by_sym = {op["symbol"]: op for op in abiertos_validos}
     cupo_lleno = len(abiertos_validos) >= MAX_POSICIONES_SIMULTANEAS
+
+    # Estado horario en tiempo real basado en el reloj actual UTC-4 (no en la vela previa de 07:55)
+    es_finde_ahora = ahora.weekday() >= 5
+    en_horario_ahora = (HORA_INICIO <= ahora.hour < HORA_FIN) and (operar_finde or not es_finde_ahora)
 
     lineas = [
         f"{VERSION}",
@@ -1383,9 +1401,9 @@ def construir_mensaje_estado(
             estado_par = f"🛑 FRENO GLOBAL ({sl_hoy_global}/{MAX_SL_GLOBAL_DIA} SL)"
         elif cupo_lleno:
             estado_par = f"🔒 CUPO LLENO ({len(abiertos_validos)}/{MAX_POSICIONES_SIMULTANEAS})"
-        elif h.get("es_finde") and not operar_finde:
+        elif es_finde_ahora and not operar_finde:
             estado_par = "🏖️ FIN DE SEMANA"
-        elif not h.get("en_horario", False):
+        elif not en_horario_ahora:
             estado_par = "🌙 FUERA DE SESIÓN (08-13h)"
         elif p_par >= MAX_DERROTAS_PAR_DIA:
             estado_par = f"⛔ LÍMITE PAR ({p_par}/{MAX_DERROTAS_PAR_DIA} SL)"
@@ -1487,6 +1505,15 @@ def main() -> None:
             huds[sym] = res["hud"]
         time.sleep(0.15)  # Protección Rate-Limit Bitget
 
+    # Bloqueo anti-fantasma: solo aceptar cierres nuevos recientes (últimas 2h) sin tocar el CSV histórico
+    now_ms = int(time.time() * 1000)
+    ultimo_ts = int(float(estado.get("ultimo_ts_evento", TS_INICIO_V39_MS)))
+    limite_retroactivo_ms = max(TS_INICIO_V39_MS, now_ms - VENTANA_CIERRE_VALIDO_MS)
+    nuevos_cerrados = [
+        t for t in nuevos_cerrados
+        if int(float(t["TS_Salida_MS"])) >= limite_retroactivo_ms
+    ]
+
     df_hist = cargar_csv_historico()
     df_final, uids_validos, abiertos_validos, freno_activo_hoy, sl_hoy_global = aplicar_filtros_cartera(
         df_hist, nuevos_cerrados, ops_abiertas
@@ -1497,7 +1524,6 @@ def main() -> None:
     generar_excel_bitacora(df_final)
 
     # Filtrar eventos de Telegram: solo emitir eventos cuyo UID pasó cupo y freno diario
-    ultimo_ts = int(float(estado.get("ultimo_ts_evento", TS_INICIO_V39_MS)))
     eventos_emitibles = sorted(
         [
             ev for ev in todos_eventos
@@ -1538,7 +1564,7 @@ def main() -> None:
     if es_laboral and (HORA_INICIO <= ahora.hour <= HORA_FIN) and ahora.minute < 10:
         if estado.get("ultima_hora_reporte") != clave_hora:
             msg_estado = construir_mensaje_estado(
-                df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, operar_finde
+                df_final, huds, abiertos_validos, freno_activo_hoy, sl_hoy_global, operar_finde, ahora=ahora
             )
             enviar_mensaje_telegram(msg_estado, construir_teclado_panel(operar_finde))
             estado["ultima_hora_reporte"] = clave_hora
